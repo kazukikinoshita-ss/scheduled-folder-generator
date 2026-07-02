@@ -1,0 +1,668 @@
+// =========================================================
+// スクリプトプロパティから安全にURLを取得（直通のユニークURL）
+// =========================================================
+const SLACK_WEBHOOK_URL = PropertiesService.getScriptProperties().getProperty('SLACK_WEBHOOK_URL');
+
+function onOpen() {
+  const ui = SpreadsheetApp.getUi();
+  const menu = ui.createMenu("スクリプト");
+  menu.addItem("【手動】個別フォルダ生成＆作成", "manual_make_folder");
+  menu.addItem("【自動】SFデータから一括作成", "auto_make_folder_from_sf");
+  menu.addToUi();
+}
+
+// =========================================================
+// 安全な日付変換と文字列平滑化関数
+// =========================================================
+function parseSafeDate(val) {
+  if (val instanceof Date) {
+    return isNaN(val.getTime()) ? null : val;
+  }
+  if (!val) return null;
+  
+  let str = String(val).trim();
+  if (!str) return null;
+  
+  if (!isNaN(str)) {
+    let num = parseFloat(str);
+    if (num > 30000 && num < 60000) { 
+      return new Date((num - 25569) * 86400 * 1000);
+    }
+  }
+
+  str = str.replace(/-/g, "/");
+  let d = new Date(str);
+  if (!isNaN(d.getTime())) return d;
+  
+  if (/^\d{6}$/.test(str)) {
+    let y = parseInt(str.substring(0, 4), 10);
+    let m = parseInt(str.substring(4, 6), 10) - 1;
+    return new Date(y, m, 1);
+  }
+  
+  let matches = str.match(/(\d{4})[\/\-_]?(\d{1,2})([\/\-_]?(\d{1,2}))?/);
+  if (matches) {
+    let year = parseInt(matches[1], 10);
+    let month = parseInt(matches[2], 10) - 1;
+    let day = matches[4] ? parseInt(matches[4], 10) : 1;
+    return new Date(year, month, day);
+  }
+  
+  return null;
+}
+
+function formatCompareValue(val) {
+  let d = parseSafeDate(val);
+  if (d) {
+    return Utilities.formatDate(d, Session.getScriptTimeZone(), "yyyy/MM/dd");
+  }
+  return String(val).trim();
+}
+
+// =========================================================
+// マスタからリストを生成する共通ヘルパー
+// =========================================================
+function buildLayerDataFromMaster(masterData, startNo, layer1Name, monthList, supplierAInput, supplierBInput, isManual) {
+  let generated = [];
+  let no = startNo;
+
+  const sA = Array.isArray(supplierAInput) ? supplierAInput : (supplierAInput ? [supplierAInput] : []);
+  const sB = Array.isArray(supplierBInput) ? supplierBInput : (supplierBInput ? [supplierBInput] : []);
+
+  for (let r = 1; r < masterData.length; r++) { 
+    let mRow = masterData[r];
+    let rowStr = mRow.join("");
+    if (!rowStr) continue; 
+
+    const hasPlaceholderA = mRow.some(cell => /[仕仕][入入][先先][AＡ]/.test(String(cell)));
+    const hasPlaceholderB = mRow.some(cell => /[仕仕][入入][先先][BＢ]/.test(String(cell)));
+    const hasYYYYMM = mRow.some(cell => /[yY][yY][yY][yY][mM][mM]/.test(String(cell)));
+
+    let targetSuppliers = [""]; 
+    let currentType = "";       
+
+    if (hasPlaceholderA) {
+      if (sA.length === 0) continue; 
+      targetSuppliers = sA;
+      currentType = "A";
+    } else if (hasPlaceholderB) {
+      if (sB.length === 0) continue; 
+      targetSuppliers = sB;
+      currentType = "B";
+    }
+
+    for (let sIdx = 0; sIdx < targetSuppliers.length; sIdx++) {
+      const currentSupplier = targetSuppliers[sIdx];
+
+      if (hasYYYYMM && monthList.length > 0) {
+        for (let m = 0; m < monthList.length; m++) {
+          let newRow = [no++];
+          for (let c = 0; c < mRow.length; c++) {
+            let val = mRow[c];
+            
+            if (c === 0) {
+              val = layer1Name; 
+            } else if (/[yY][yY][yY][yY][mM][mM]/.test(String(val))) {
+              val = String(val).replace(/[yY][yY][yY][yY][mM][mM]/g, monthList[m]); 
+            } else if (typeof val === 'string') {
+              if (currentType === "A") {
+                val = val.replace(/[仕仕][入入][先先][AＡ]/g, currentSupplier);
+              } else if (currentType === "B") {
+                val = val.replace(/[仕仕][入入][先先][BＢ]/g, currentSupplier);
+              }
+            }
+            if (val !== "") newRow.push(val);
+          }
+          generated.push(newRow);
+        }
+      } else {
+        let newRow = [no++];
+        for (let c = 0; c < mRow.length; c++) {
+          let val = mRow[c];
+          
+          if (c === 0) {
+            val = layer1Name;
+          } else if (/[yY][yY][yY][yY][mM][mM]/.test(String(val))) {
+            val = ""; 
+          } else if (typeof val === 'string') {
+            if (currentType === "A") {
+              val = val.replace(/[仕仕][入入][先先][AＡ]/g, currentSupplier);
+            } else if (currentType === "B") {
+              val = val.replace(/[仕仕][入入][先先][BＢ]/g, currentSupplier);
+            }
+          }
+          if (val !== "") newRow.push(val);
+        }
+        generated.push(newRow);
+      }
+    }
+  }
+  return { data: generated, nextNo: no };
+}
+
+// =========================================================
+// Slack通知共通関数
+// =========================================================
+function sendSlackNotification(newFolders) {
+  if (newFolders.length === 0) return;
+
+  const webhookUrl = PropertiesService.getScriptProperties().getProperty('SLACK_WEBHOOK_URL');
+  if (!webhookUrl) {
+    console.error("Slack Webhook URLがスクリプトプロパティに設定されていません。");
+    return;
+  }
+
+  let slackBody = `証憑フォルダが新規作成されました（計 ${newFolders.length} 件）\n` +
+                  `-----------------------------------\n`;
+
+  newFolders.forEach((f) => {
+    // URLをそのままベタ書き（Slackが自動でリンク化してくれます）
+    slackBody += `${f.name}\n${f.url}\n\n`;
+  });
+
+  slackBody += `-----------------------------------`;
+
+  const payloadData = {
+    "text": slackBody
+  };
+
+  const options = {
+    "method": "POST",
+    "contentType": "application/json",
+    "payload": JSON.stringify(payloadData),
+    "muteHttpExceptions": true 
+  };
+
+  try {
+    const response = UrlFetchApp.fetch(webhookUrl, options);
+    const responseCode = response.getResponseCode();
+    if (responseCode !== 200) {
+      console.error(`Slack通知エラー: HTTP ${responseCode} - ${response.getContentText()}`);
+    }
+  } catch (e) {
+    console.error("Slack通知通信エラー: " + e.message);
+  }
+}
+
+// =========================================================
+// 【手動モード】個別フォルダ生成＆作成
+// =========================================================
+function manual_make_folder() {
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  const sheet = ss.getSheetByName("Workspace");
+  const masterSheet = ss.getSheetByName("[マスタ]layer"); 
+
+  let ui;
+  try {
+    ui = SpreadsheetApp.getUi();
+  } catch (e) {
+    ui = null;
+  }
+
+  if (!sheet) {
+    if (ui) ui.alert("「Workspace」シートが見つかりません。");
+    else console.error("「Workspace」シートが見つかりません。");
+    return;
+  }
+  if (!masterSheet) {
+    if (ui) ui.alert("「[マスタ]layer」シートが見つかりません。");
+    else console.error("「[マスタ]layer」シートが見つかりません。");
+    return;
+  }
+  
+  const lastRow = sheet.getLastRow();
+  if (lastRow >= 9) {
+    sheet.getRange(9, 1, lastRow - 8, sheet.getLastColumn()).clearContent();
+  }
+
+  const folderBaseName = sheet.getRange("B2").getValue();
+  const startDate = parseSafeDate(sheet.getRange("B3").getValue());
+  const endDate = parseSafeDate(sheet.getRange("B4").getValue());
+  const supplierA = sheet.getRange("B5").getValue();
+  const supplierB = sheet.getRange("B6").getValue();
+
+  let monthList = [];
+
+  if (startDate && endDate) {
+    let currentMonth = new Date(startDate.getTime());
+    currentMonth.setDate(1); 
+    let endMonth = new Date(endDate.getTime());
+    endMonth.setDate(1);
+
+    while (currentMonth <= endMonth) {
+      monthList.push(Utilities.formatDate(currentMonth, Session.getScriptTimeZone(), "yyyyMM"));
+      currentMonth.setMonth(currentMonth.getMonth() + 1);
+    }
+  }
+
+  const layer1 = `${folderBaseName}`;
+
+  const masterData = masterSheet.getDataRange().getValues();
+  const result = buildLayerDataFromMaster(masterData, 1, layer1, monthList, supplierA, supplierB, true);
+  const generatedData = result.data;
+
+  if (generatedData.length === 0) return;
+
+  const maxCol = Math.max(...generatedData.map(row => row.length));
+  const formattedData = generatedData.map(row => {
+    let newRow = [...row];
+    while (newRow.length < maxCol) newRow.push(""); 
+    return newRow;
+  });
+
+  sheet.getRange(9, 1, formattedData.length, maxCol).setValues(formattedData);
+  SpreadsheetApp.flush(); 
+
+  let folder_id_root = sheet.getRange("B1").getValue().toString().trim();
+  if (!folder_id_root || folder_id_root === "ここに入力") {
+    if (ui) ui.alert("B1セルにルートフォルダのURLを入力してください。");
+    return;
+  }
+  const match = folder_id_root.match(/[-\w]{25,}/);
+  if (match) folder_id_root = match[0];
+
+  let folder_root;
+  try {
+    folder_root = DriveApp.getFolderById(folder_id_root);
+  } catch (e) {
+    if (ui) ui.alert("B1セルのURLが正しくありません。");
+    return;
+  }
+
+  const folderData = sheet.getRange(9, 2, formattedData.length, maxCol - 1).getValues();
+  let created_count = 0;
+  const folderCache = {};
+  
+  let layer1Urls = [];
+  let newlyCreatedLayer1Folders = [];
+  let seenLayer1InThisRun = new Set();
+
+  for (let i = 0; i < folderData.length; i++) {
+    let row = folderData[i];
+    let folder = folder_root;
+    let currentPath = folder_id_root;
+    let currentLayer1Url = ""; 
+    let isNewLayer1 = false;
+
+    for (let j = 0; j < row.length; j++) {
+      if (row[j] === "") continue; 
+      let folder_name = String(row[j]).trim();
+      if (!folder_name) continue;
+
+      currentPath += "/" + folder_name;
+
+      if (folderCache[currentPath]) {
+        folder = folderCache[currentPath];
+      } else {
+        let folders = folder.getFoldersByName(folder_name);
+        if (folders.hasNext()) {
+          folder = folders.next();
+        } else {
+          folder = folder.createFolder(folder_name);
+          created_count++;
+          if (j === 0) isNewLayer1 = true; 
+        }
+        folderCache[currentPath] = folder;
+      }
+      
+      if (j === 0) {
+        currentLayer1Url = folder.getUrl();
+        if (isNewLayer1 && !seenLayer1InThisRun.has(folder_name)) {
+          newlyCreatedLayer1Folders.push({ name: folder_name, url: currentLayer1Url });
+          seenLayer1InThisRun.add(folder_name);
+        }
+      }
+    }
+    layer1Urls.push([currentLayer1Url]);
+  }
+
+  if (layer1Urls.length > 0) {
+    sheet.getRange(9, maxCol + 1, layer1Urls.length, 1).setValues(layer1Urls);
+  }
+
+  sendSlackNotification(newlyCreatedLayer1Folders);
+
+  if (created_count === 0) {
+    if (ui) ui.alert("処理完了（すべて作成済みでした）");
+  } else {
+    if (ui) ui.alert("処理完了：新たに " + created_count + " 個のフォルダを作成しました。");
+  }
+}
+
+// =========================================================
+// 【自動モード】裏でWorkspace制御 ＆ 新規分Slack通知
+// =========================================================
+function auto_make_folder_from_sf() {
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  
+  const mainSheet = ss.getSheetByName("Workspace"); 
+  const masterSheet = ss.getSheetByName("[マスタ]layer");
+  const rawFolderSheet = ss.getSheetByName("raw_folder");
+
+  let ui;
+  try {
+    ui = SpreadsheetApp.getUi();
+  } catch (e) {
+    ui = null; 
+  }
+
+  if (!mainSheet) {
+    if (ui) ui.alert("「Workspace」シートが見つかりません。");
+    else console.error("「Workspace」シートが見つかりません。");
+    return;
+  }
+  if (!masterSheet) {
+    if (ui) ui.alert("「[マスタ]layer」シートが見つかりません。");
+    else console.error("「[マスタ]layer」シートが見つかりません。");
+    return;
+  }
+  if (!rawFolderSheet) {
+    if (ui) ui.alert("「raw_folder」シートが見つかりません。");
+    else console.error("「raw_folder」シートが見つかりません。");
+    return;
+  }
+
+  const sfSheet = ss.getSheetByName("raw_SF_TODAY");
+  if (!sfSheet) {
+    if (ui) ui.alert("「raw_SF_TODAY」シートが見つかりません。");
+    else console.error("「raw_SF_TODAY」シートが見つかりません。");
+    return;
+  }
+
+  let logSheet = ss.getSheetByName("log_SF");
+  if (!logSheet) {
+    logSheet = ss.insertSheet("log_SF");
+  }
+
+  let parent_folder_url = rawFolderSheet.getRange("B1").getValue().toString().trim();
+  let target_folder_name = rawFolderSheet.getRange("B2").getValue().toString().trim();
+
+  if (!parent_folder_url || parent_folder_url === "ここに入力" || !target_folder_name) {
+    if (ui) ui.alert("raw_folderシートのB1（上位URL）またはB2（フォルダ名）が正しく入力されていません。");
+    else console.warn("raw_folderの入力不備によりスキップされました。");
+    return;
+  }
+  
+  const match = parent_folder_url.match(/[-\w]{25,}/);
+  if (match) parent_folder_url = match[0];
+
+  let parent_folder;
+  try {
+    parent_folder = DriveApp.getFolderById(parent_folder_url);
+  } catch (e) {
+    if (ui) ui.alert("raw_folderシートのB1セルのURLが正しくありません。");
+    else console.error("大元フォルダの取得に失敗しました。");
+    return;
+  }
+
+  let folder_root;
+  let targetFolders = parent_folder.getFoldersByName(target_folder_name);
+  if (targetFolders.hasNext()) {
+    folder_root = targetFolders.next();
+  } else {
+    folder_root = parent_folder.createFolder(target_folder_name);
+  }
+  
+  let folder_id_root = folder_root.getId();
+
+  const lastRow = mainSheet.getLastRow();
+  if (lastRow >= 9) {
+    mainSheet.getRange(9, 1, lastRow - 8, mainSheet.getLastColumn()).clearContent();
+  }
+
+  const sfData = sfSheet.getDataRange().getValues();
+  const logData = logSheet.getDataRange().getValues();
+  const masterData = masterSheet.getDataRange().getValues();
+
+  const headers = sfData[0];
+  const pCodeIndex = headers.findIndex(h => {
+    const s = String(h).replace(/\s/g, "").toLowerCase();
+    return s.includes("projectcode") || s.includes("プロジェクトコード");
+  });
+  const nameIndex = headers.findIndex(h => String(h).replace(/\s/g, "").includes("商谈名") || String(h).replace(/\s/g, "").includes("商談名"));
+  const startIndex = headers.findIndex(h => String(h).replace(/\s/g, "").includes("売上開始月"));
+  const endIndex = headers.findIndex(h => String(h).replace(/\s/g, "").includes("売上終了月"));
+  const productIndex = headers.findIndex(h => String(h).replace(/\s/g, "").includes("商品"));
+  const supplierIndex = headers.findIndex(h => String(h).replace(/\s/g, "").includes("仕入先"));
+  
+  const buIndex = headers.findIndex(h => String(h).replace(/\s/g, "").toLowerCase().includes("businessunit"));
+  const deptIndex = headers.findIndex(h => String(h).replace(/\s/g, "").includes("計上部署"));
+
+  if (pCodeIndex === -1 || nameIndex === -1 || buIndex === -1 || deptIndex === -1) {
+    if (ui) ui.alert("raw_SF_TODAYシートに必須列（Project Code、商談名、Business Unit Name、計上部署）のいずれかが見つかりません。");
+    else console.error("必須列が不足しているため処理を中断しました。");
+    return;
+  }
+
+  let statusIndex = headers.indexOf("自動作成ステータス");
+  if (statusIndex === -1) {
+    statusIndex = headers.length;
+    sfSheet.getRange(1, statusIndex + 1).setValue("自動作成ステータス");
+  } else {
+    if (sfData.length > 1) {
+      sfSheet.getRange(2, statusIndex + 1, sfData.length - 1, 1).clearContent();
+    }
+  }
+
+  const logSet = new Set();
+  if (logData.length > 1) {
+    const logHeaders = logData[0];
+    const lpIdx = logHeaders.findIndex(h => String(h).replace(/\s/g, "").toLowerCase().includes("projectcode"));
+    const lnIdx = logHeaders.findIndex(h => String(h).replace(/\s/g, "").includes("商談名"));
+    const lsIdx = logHeaders.findIndex(h => String(h).replace(/\s/g, "").includes("売上開始月"));
+    const leIdx = logHeaders.findIndex(h => String(h).replace(/\s/g, "").includes("売上終了月"));
+    const lpNameIdx = logHeaders.findIndex(h => String(h).replace(/\s/g, "").includes("商品"));
+    const lsupIdx = logHeaders.findIndex(h => String(h).replace(/\s/g, "").includes("仕入先"));
+
+    for (let i = 1; i < logData.length; i++) {
+      const p = lpIdx !== -1 ? formatCompareValue(logData[i][lpIdx]) : "";
+      const n = lnIdx !== -1 ? formatCompareValue(logData[i][lnIdx]) : "";
+      const s = lsIdx !== -1 ? formatCompareValue(logData[i][lsIdx]) : "";
+      const e = leIdx !== -1 ? formatCompareValue(logData[i][leIdx]) : "";
+      const pr = lpNameIdx !== -1 ? formatCompareValue(logData[i][lpNameIdx]) : "";
+      const su = lsupIdx !== -1 ? formatCompareValue(logData[i][lsupIdx]) : "";
+      
+      logSet.add(`${p}🏎️${n}🏎️${s}🏎️${e}🏎️${pr}🏎️${su}`);
+    }
+  }
+
+  const groups = {};
+  let hasAnyGroupChanged = false;
+
+  for (let i = 1; i < sfData.length; i++) {
+    const oppName = sfData[i][nameIndex];
+    if (!oppName) continue;
+
+    let pCode = sfData[i][pCodeIndex] ? String(sfData[i][pCodeIndex]).trim() : "";
+    if (!pCode) pCode = "SFXXXXXXXX";
+    
+    const buVal = String(sfData[i][buIndex]).trim() || "BU未指定";
+    const deptVal = String(sfData[i][deptIndex]).trim() || "部署未指定";
+
+    const startVal = startIndex !== -1 ? formatCompareValue(sfData[i][startIndex]) : "";
+    const endVal = endIndex !== -1 ? formatCompareValue(sfData[i][endIndex]) : "";
+    const prodVal = productIndex !== -1 ? formatCompareValue(sfData[i][productIndex]) : "";
+    const suppVal = supplierIndex !== -1 ? formatCompareValue(sfData[i][supplierIndex]) : "";
+
+    const groupKey = pCode + "___" + oppName + "___" + buVal + "___" + deptVal;
+
+    if (!groups[groupKey]) {
+      groups[groupKey] = {
+        projectCode: pCode,
+        oppName: oppName,
+        buName: buVal,
+        deptName: deptVal,
+        supplierA: [], 
+        supplierB: [], 
+        rawStart: sfData[i][startIndex] || null,
+        rawEnd: sfData[i][endIndex] || null,
+        rowIndexes: [],
+        isChanged: false 
+      };
+    }
+
+    groups[groupKey].rowIndexes.push(i + 1);
+
+    if (productIndex !== -1 && supplierIndex !== -1 && suppVal) {
+      if (/[AＡ]/.test(prodVal)) {
+        if (!groups[groupKey].supplierA.includes(suppVal)) groups[groupKey].supplierA.push(suppVal);
+      } else if (/[BＢ]/.test(prodVal)) {
+        if (!groups[groupKey].supplierB.includes(suppVal)) groups[groupKey].supplierB.push(suppVal);
+      } else {
+        if (!groups[groupKey].supplierA.includes(suppVal)) groups[groupKey].supplierA.push(suppVal);
+      }
+    }
+
+    const currentLineKey = `${pCode}🏎️${oppName}🏎️${startVal}🏎️${endVal}🏎️${prodVal}🏎️${suppVal}`;
+    if (!logSet.has(currentLineKey)) {
+      groups[groupKey].isChanged = true;
+      hasAnyGroupChanged = true;
+    }
+  }
+
+  if (!hasAnyGroupChanged) {
+    if (sfData.length > 1) {
+      sfSheet.getRange(2, statusIndex + 1, sfData.length - 1, 1).setValue("完了");
+    }
+    SpreadsheetApp.flush();
+    logSheet.clear();
+    const finalSfDataNoChange = sfSheet.getDataRange().getValues();
+    logSheet.getRange(1, 1, finalSfDataNoChange.length, finalSfDataNoChange[0].length).setValues(finalSfDataNoChange);
+    
+    if (ui) ui.alert("変更箇所はありませんでした。（処理を高速スキップしました）");
+    else console.log("変更箇所がないため、高速スキップしました。");
+    return;
+  }
+
+  let allGeneratedData = [];
+  let processedRows = [];
+  let no = 1;
+
+  for (const key in groups) {
+    const group = groups[key];
+    
+    if (!group.isChanged) {
+      continue;
+    }
+
+    let monthList = [];
+
+    if (group.rawStart && group.rawEnd) {
+      let sDate = parseSafeDate(group.rawStart);
+      let eDate = parseSafeDate(group.rawEnd);
+
+      if (sDate && eDate) {
+        let currentMonth = new Date(sDate.getTime());
+        currentMonth.setDate(1); 
+        let endMonth = new Date(eDate.getTime());
+        endMonth.setDate(1);
+
+        while (currentMonth <= endMonth) {
+          monthList.push(Utilities.formatDate(currentMonth, Session.getScriptTimeZone(), "yyyyMM"));
+          currentMonth.setMonth(currentMonth.getMonth() + 1);
+        }
+      }
+    }
+
+    const layer1 = `PJC：${group.projectCode}（商談名：${group.oppName}）`;
+    const result = buildLayerDataFromMaster(masterData, no, layer1, monthList, group.supplierA, group.supplierB, true);
+    
+    const dynamicInjectedData = result.data.map(row => {
+      let newRow = [...row];
+      newRow.splice(1, 0, group.buName, group.deptName); 
+      return newRow;
+    });
+
+    allGeneratedData.push(...dynamicInjectedData);
+    no = result.nextNo; 
+    processedRows.push(...group.rowIndexes); 
+  }
+
+  if (allGeneratedData.length === 0) {
+    if (sfData.length > 1) {
+      sfSheet.getRange(2, statusIndex + 1, sfData.length - 1, 1).setValue("完了");
+    }
+    SpreadsheetApp.flush();
+    logSheet.clear();
+    const finalSfDataNoMaster = sfSheet.getDataRange().getValues();
+    logSheet.getRange(1, 1, finalSfDataNoMaster.length, finalSfDataNoMaster[0].length).setValues(finalSfDataNoMaster);
+    
+    if (ui) ui.alert("処理完了：データ変更はありましたが、マスタに合致する定義がないためフォルダ作成をスキップしました。");
+    else console.log("マスタに合致する定義がないためスキップしました。");
+    return;
+  }
+
+  const maxCol = Math.max(...allGeneratedData.map(row => row.length));
+  const formattedData = allGeneratedData.map(row => {
+    let newRow = [...row];
+    while (newRow.length < maxCol) newRow.push(""); 
+    return newRow;
+  });
+  mainSheet.getRange(9, 1, formattedData.length, maxCol).setValues(formattedData);
+  SpreadsheetApp.flush(); 
+
+  const folderData = mainSheet.getRange(9, 2, formattedData.length, maxCol - 1).getValues();
+  let createdCount = 0;
+  const folderCache = {}; 
+  
+  let layer1Urls = [];
+  let newlyCreatedLayer1Folders = [];
+  let seenLayer1InThisRun = new Set();
+
+  for (let i = 0; i < folderData.length; i++) {
+    let row = folderData[i];
+    let folder = folder_root;
+    let currentPath = folder_id_root; 
+    let currentLayer1Url = ""; 
+    let isNewLayer1 = false;
+
+    for (let j = 0; j < row.length; j++) {
+      if (row[j] === "") continue; 
+      let folder_name = String(row[j]).trim();
+      if (!folder_name) continue;
+
+      currentPath += "/" + folder_name;
+
+      if (folderCache[currentPath]) {
+        folder = folderCache[currentPath];
+      } else {
+        let folders = folder.getFoldersByName(folder_name);
+        if (folders.hasNext()) {
+          folder = folders.next();
+        } else {
+          folder = folder.createFolder(folder_name);
+          createdCount++;
+          if (j === 2) isNewLayer1 = true; 
+        }
+        folderCache[currentPath] = folder;
+      }
+      
+      if (j === 2) {
+        currentLayer1Url = folder.getUrl();
+        if (isNewLayer1 && !seenLayer1InThisRun.has(folder_name)) {
+          newlyCreatedLayer1Folders.push({ name: folder_name, url: currentLayer1Url });
+          seenLayer1InThisRun.add(folder_name);
+        }
+      }
+    }
+    layer1Urls.push([currentLayer1Url]);
+  }
+
+  if (layer1Urls.length > 0) {
+    mainSheet.getRange(9, maxCol + 1, layer1Urls.length, 1).setValues(layer1Urls);
+  }
+
+  sendSlackNotification(newlyCreatedLayer1Folders);
+
+  if (sfData.length > 1) {
+    sfSheet.getRange(2, statusIndex + 1, sfData.length - 1, 1).setValue("完了");
+  }
+  SpreadsheetApp.flush(); 
+
+  logSheet.clear();
+  const finalSfDataWithChange = sfSheet.getDataRange().getValues(); 
+  logSheet.getRange(1, 1, finalSfDataWithChange.length, finalSfDataWithChange[0].length).setValues(finalSfDataWithChange);
+
+  if (ui) ui.alert(`処理完了：変更のあった案件の解析を行い、raw_folder指定の大元フォルダ配下から階層を自動探索し、新たに ${createdCount} 個のフォルダを差分作成しました。`);
+  else console.log(`トリガー自動実行完了：新たに ${createdCount} 個のフォルダを差分作成し、Slackへ通知しました。`);
+}
