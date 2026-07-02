@@ -1,4 +1,9 @@
 // =========================================================
+// 設定
+// =========================================================
+const SHEET_NAME_SF = "raw_SF_7DAYS";
+
+// =========================================================
 // スクリプトプロパティから安全にURLを取得（直通のユニークURL）
 // =========================================================
 const SLACK_WEBHOOK_URL = PropertiesService.getScriptProperties().getProperty('SLACK_WEBHOOK_URL');
@@ -22,7 +27,7 @@ function parseSafeDate(val) {
   
   let str = String(val).trim();
   if (!str) return null;
-  
+
   if (!isNaN(str)) {
     let num = parseFloat(str);
     if (num > 30000 && num < 60000) { 
@@ -33,7 +38,7 @@ function parseSafeDate(val) {
   str = str.replace(/-/g, "/");
   let d = new Date(str);
   if (!isNaN(d.getTime())) return d;
-  
+
   if (/^\d{6}$/.test(str)) {
     let y = parseInt(str.substring(0, 4), 10);
     let m = parseInt(str.substring(4, 6), 10) - 1;
@@ -79,7 +84,7 @@ function buildLayerDataFromMaster(masterData, startNo, layer1Name, monthList, su
     const hasYYYYMM = mRow.some(cell => /[yY][yY][yY][yY][mM][mM]/.test(String(cell)));
 
     let targetSuppliers = [""]; 
-    let currentType = "";       
+    let currentType = "";
 
     if (hasPlaceholderA) {
       if (sA.length === 0) continue; 
@@ -99,11 +104,10 @@ function buildLayerDataFromMaster(masterData, startNo, layer1Name, monthList, su
           let newRow = [no++];
           for (let c = 0; c < mRow.length; c++) {
             let val = mRow[c];
-            
             if (c === 0) {
-              val = layer1Name; 
+              val = layer1Name;
             } else if (/[yY][yY][yY][yY][mM][mM]/.test(String(val))) {
-              val = String(val).replace(/[yY][yY][yY][yY][mM][mM]/g, monthList[m]); 
+              val = String(val).replace(/[yY][yY][yY][yY][mM][mM]/g, monthList[m]);
             } else if (typeof val === 'string') {
               if (currentType === "A") {
                 val = val.replace(/[仕仕][入入][先先][AＡ]/g, currentSupplier);
@@ -119,11 +123,10 @@ function buildLayerDataFromMaster(masterData, startNo, layer1Name, monthList, su
         let newRow = [no++];
         for (let c = 0; c < mRow.length; c++) {
           let val = mRow[c];
-          
           if (c === 0) {
             val = layer1Name;
           } else if (/[yY][yY][yY][yY][mM][mM]/.test(String(val))) {
-            val = ""; 
+            val = "";
           } else if (typeof val === 'string') {
             if (currentType === "A") {
               val = val.replace(/[仕仕][入入][先先][AＡ]/g, currentSupplier);
@@ -154,14 +157,12 @@ function sendSlackNotification(newFolders) {
 
   let slackBody = `証憑フォルダが新規作成されました（計 ${newFolders.length} 件）\n` +
                   `-----------------------------------\n`;
-
   newFolders.forEach((f) => {
     // URLをそのままベタ書き（Slackが自動でリンク化してくれます）
     slackBody += `${f.name}\n${f.url}\n\n`;
   });
 
   slackBody += `-----------------------------------`;
-
   const payloadData = {
     "text": slackBody
   };
@@ -190,8 +191,8 @@ function sendSlackNotification(newFolders) {
 function manual_make_folder() {
   const ss = SpreadsheetApp.getActiveSpreadsheet();
   const sheet = ss.getSheetByName("Workspace");
-  const masterSheet = ss.getSheetByName("[マスタ]layer"); 
-
+  const masterSheet = ss.getSheetByName("[マスタ]layer");
+  
   let ui;
   try {
     ui = SpreadsheetApp.getUi();
@@ -249,7 +250,7 @@ function manual_make_folder() {
     while (newRow.length < maxCol) newRow.push(""); 
     return newRow;
   });
-
+  
   sheet.getRange(9, 1, formattedData.length, maxCol).setValues(formattedData);
   SpreadsheetApp.flush(); 
 
@@ -276,21 +277,22 @@ function manual_make_folder() {
   let layer1Urls = [];
   let newlyCreatedLayer1Folders = [];
   let seenLayer1InThisRun = new Set();
-
+  
   for (let i = 0; i < folderData.length; i++) {
     let row = folderData[i];
     let folder = folder_root;
     let currentPath = folder_id_root;
     let currentLayer1Url = ""; 
     let isNewLayer1 = false;
-
+    
     for (let j = 0; j < row.length; j++) {
-      if (row[j] === "") continue; 
+      if (row[j] === "") continue;
+      
       let folder_name = String(row[j]).trim();
       if (!folder_name) continue;
 
       currentPath += "/" + folder_name;
-
+      
       if (folderCache[currentPath]) {
         folder = folderCache[currentPath];
       } else {
@@ -321,7 +323,7 @@ function manual_make_folder() {
   }
 
   sendSlackNotification(newlyCreatedLayer1Folders);
-
+  
   if (created_count === 0) {
     if (ui) ui.alert("処理完了（すべて作成済みでした）");
   } else {
@@ -335,7 +337,7 @@ function manual_make_folder() {
 function auto_make_folder_from_sf() {
   const ss = SpreadsheetApp.getActiveSpreadsheet();
   
-  const mainSheet = ss.getSheetByName("Workspace"); 
+  const mainSheet = ss.getSheetByName("Workspace");
   const masterSheet = ss.getSheetByName("[マスタ]layer");
   const rawFolderSheet = ss.getSheetByName("raw_folder");
 
@@ -343,7 +345,7 @@ function auto_make_folder_from_sf() {
   try {
     ui = SpreadsheetApp.getUi();
   } catch (e) {
-    ui = null; 
+    ui = null;
   }
 
   if (!mainSheet) {
@@ -362,10 +364,11 @@ function auto_make_folder_from_sf() {
     return;
   }
 
-  const sfSheet = ss.getSheetByName("raw_SF_TODAY");
+  // ★ シート名定数を使用
+  const sfSheet = ss.getSheetByName(SHEET_NAME_SF);
   if (!sfSheet) {
-    if (ui) ui.alert("「raw_SF_TODAY」シートが見つかりません。");
-    else console.error("「raw_SF_TODAY」シートが見つかりません。");
+    if (ui) ui.alert("「" + SHEET_NAME_SF + "」シートが見つかりません。");
+    else console.error("「" + SHEET_NAME_SF + "」シートが見つかりません。");
     return;
   }
 
@@ -376,7 +379,7 @@ function auto_make_folder_from_sf() {
 
   let parent_folder_url = rawFolderSheet.getRange("B1").getValue().toString().trim();
   let target_folder_name = rawFolderSheet.getRange("B2").getValue().toString().trim();
-
+  
   if (!parent_folder_url || parent_folder_url === "ここに入力" || !target_folder_name) {
     if (ui) ui.alert("raw_folderシートのB1（上位URL）またはB2（フォルダ名）が正しく入力されていません。");
     else console.warn("raw_folderの入力不備によりスキップされました。");
@@ -404,7 +407,7 @@ function auto_make_folder_from_sf() {
   }
   
   let folder_id_root = folder_root.getId();
-
+  
   const lastRow = mainSheet.getLastRow();
   if (lastRow >= 9) {
     mainSheet.getRange(9, 1, lastRow - 8, mainSheet.getLastColumn()).clearContent();
@@ -415,10 +418,12 @@ function auto_make_folder_from_sf() {
   const masterData = masterSheet.getDataRange().getValues();
 
   const headers = sfData[0];
+  
   const pCodeIndex = headers.findIndex(h => {
     const s = String(h).replace(/\s/g, "").toLowerCase();
     return s.includes("projectcode") || s.includes("プロジェクトコード");
   });
+  
   const nameIndex = headers.findIndex(h => String(h).replace(/\s/g, "").includes("商谈名") || String(h).replace(/\s/g, "").includes("商談名"));
   const startIndex = headers.findIndex(h => String(h).replace(/\s/g, "").includes("売上開始月"));
   const endIndex = headers.findIndex(h => String(h).replace(/\s/g, "").includes("売上終了月"));
@@ -429,7 +434,8 @@ function auto_make_folder_from_sf() {
   const deptIndex = headers.findIndex(h => String(h).replace(/\s/g, "").includes("計上部署"));
 
   if (pCodeIndex === -1 || nameIndex === -1 || buIndex === -1 || deptIndex === -1) {
-    if (ui) ui.alert("raw_SF_TODAYシートに必須列（Project Code、商談名、Business Unit Name、計上部署）のいずれかが見つかりません。");
+    // ★ エラーメッセージ内でも定数を使用
+    if (ui) ui.alert(SHEET_NAME_SF + "シートに必須列（Project Code、商談名、Business Unit Name、計上部署）のいずれかが見つかりません。");
     else console.error("必須列が不足しているため処理を中断しました。");
     return;
   }
@@ -447,13 +453,14 @@ function auto_make_folder_from_sf() {
   const logSet = new Set();
   if (logData.length > 1) {
     const logHeaders = logData[0];
+    
     const lpIdx = logHeaders.findIndex(h => String(h).replace(/\s/g, "").toLowerCase().includes("projectcode"));
     const lnIdx = logHeaders.findIndex(h => String(h).replace(/\s/g, "").includes("商談名"));
     const lsIdx = logHeaders.findIndex(h => String(h).replace(/\s/g, "").includes("売上開始月"));
     const leIdx = logHeaders.findIndex(h => String(h).replace(/\s/g, "").includes("売上終了月"));
     const lpNameIdx = logHeaders.findIndex(h => String(h).replace(/\s/g, "").includes("商品"));
     const lsupIdx = logHeaders.findIndex(h => String(h).replace(/\s/g, "").includes("仕入先"));
-
+    
     for (let i = 1; i < logData.length; i++) {
       const p = lpIdx !== -1 ? formatCompareValue(logData[i][lpIdx]) : "";
       const n = lnIdx !== -1 ? formatCompareValue(logData[i][lnIdx]) : "";
@@ -468,11 +475,11 @@ function auto_make_folder_from_sf() {
 
   const groups = {};
   let hasAnyGroupChanged = false;
-
+  
   for (let i = 1; i < sfData.length; i++) {
     const oppName = sfData[i][nameIndex];
     if (!oppName) continue;
-
+    
     let pCode = sfData[i][pCodeIndex] ? String(sfData[i][pCodeIndex]).trim() : "";
     if (!pCode) pCode = "SFXXXXXXXX";
     
@@ -483,9 +490,9 @@ function auto_make_folder_from_sf() {
     const endVal = endIndex !== -1 ? formatCompareValue(sfData[i][endIndex]) : "";
     const prodVal = productIndex !== -1 ? formatCompareValue(sfData[i][productIndex]) : "";
     const suppVal = supplierIndex !== -1 ? formatCompareValue(sfData[i][supplierIndex]) : "";
-
+    
     const groupKey = pCode + "___" + oppName + "___" + buVal + "___" + deptVal;
-
+    
     if (!groups[groupKey]) {
       groups[groupKey] = {
         projectCode: pCode,
@@ -514,6 +521,7 @@ function auto_make_folder_from_sf() {
     }
 
     const currentLineKey = `${pCode}🏎️${oppName}🏎️${startVal}🏎️${endVal}🏎️${prodVal}🏎️${suppVal}`;
+    
     if (!logSet.has(currentLineKey)) {
       groups[groupKey].isChanged = true;
       hasAnyGroupChanged = true;
@@ -537,7 +545,7 @@ function auto_make_folder_from_sf() {
   let allGeneratedData = [];
   let processedRows = [];
   let no = 1;
-
+  
   for (const key in groups) {
     const group = groups[key];
     
@@ -546,14 +554,15 @@ function auto_make_folder_from_sf() {
     }
 
     let monthList = [];
-
+    
     if (group.rawStart && group.rawEnd) {
       let sDate = parseSafeDate(group.rawStart);
       let eDate = parseSafeDate(group.rawEnd);
-
+      
       if (sDate && eDate) {
         let currentMonth = new Date(sDate.getTime());
-        currentMonth.setDate(1); 
+        currentMonth.setDate(1);
+        
         let endMonth = new Date(eDate.getTime());
         endMonth.setDate(1);
 
@@ -565,6 +574,7 @@ function auto_make_folder_from_sf() {
     }
 
     const layer1 = `PJC：${group.projectCode}（商談名：${group.oppName}）`;
+    
     const result = buildLayerDataFromMaster(masterData, no, layer1, monthList, group.supplierA, group.supplierB, true);
     
     const dynamicInjectedData = result.data.map(row => {
@@ -572,7 +582,7 @@ function auto_make_folder_from_sf() {
       newRow.splice(1, 0, group.buName, group.deptName); 
       return newRow;
     });
-
+    
     allGeneratedData.push(...dynamicInjectedData);
     no = result.nextNo; 
     processedRows.push(...group.rowIndexes); 
@@ -598,6 +608,7 @@ function auto_make_folder_from_sf() {
     while (newRow.length < maxCol) newRow.push(""); 
     return newRow;
   });
+  
   mainSheet.getRange(9, 1, formattedData.length, maxCol).setValues(formattedData);
   SpreadsheetApp.flush(); 
 
@@ -608,30 +619,34 @@ function auto_make_folder_from_sf() {
   let layer1Urls = [];
   let newlyCreatedLayer1Folders = [];
   let seenLayer1InThisRun = new Set();
-
+  
   for (let i = 0; i < folderData.length; i++) {
     let row = folderData[i];
+    
     let folder = folder_root;
     let currentPath = folder_id_root; 
     let currentLayer1Url = ""; 
     let isNewLayer1 = false;
-
+    
     for (let j = 0; j < row.length; j++) {
-      if (row[j] === "") continue; 
+      if (row[j] === "") continue;
+      
       let folder_name = String(row[j]).trim();
       if (!folder_name) continue;
 
       currentPath += "/" + folder_name;
-
+      
       if (folderCache[currentPath]) {
         folder = folderCache[currentPath];
       } else {
         let folders = folder.getFoldersByName(folder_name);
+        
         if (folders.hasNext()) {
           folder = folders.next();
         } else {
           folder = folder.createFolder(folder_name);
           createdCount++;
+          
           if (j === 2) isNewLayer1 = true; 
         }
         folderCache[currentPath] = folder;
@@ -639,6 +654,7 @@ function auto_make_folder_from_sf() {
       
       if (j === 2) {
         currentLayer1Url = folder.getUrl();
+        
         if (isNewLayer1 && !seenLayer1InThisRun.has(folder_name)) {
           newlyCreatedLayer1Folders.push({ name: folder_name, url: currentLayer1Url });
           seenLayer1InThisRun.add(folder_name);
@@ -653,7 +669,7 @@ function auto_make_folder_from_sf() {
   }
 
   sendSlackNotification(newlyCreatedLayer1Folders);
-
+  
   if (sfData.length > 1) {
     sfSheet.getRange(2, statusIndex + 1, sfData.length - 1, 1).setValue("完了");
   }
