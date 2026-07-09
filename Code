@@ -157,7 +157,7 @@ function sendSlackNotification(newFolders) {
 
   let slackBody = `証憑フォルダが新規作成されました（計 ${newFolders.length} 件）\n` +
                   `-----------------------------------\n`;
-  
+
   newFolders.forEach((f) => {
     slackBody += `${f.name}\n${f.url}\n\n`;
   });
@@ -244,14 +244,14 @@ function manual_make_folder() {
   const generatedData = result.data;
 
   if (generatedData.length === 0) return;
-
+  
   const maxCol = Math.max(...generatedData.map(row => row.length));
   const formattedData = generatedData.map(row => {
     let newRow = [...row];
     while (newRow.length < maxCol) newRow.push(""); 
     return newRow;
   });
-
+  
   sheet.getRange(9, 1, formattedData.length, maxCol).setValues(formattedData);
   SpreadsheetApp.flush(); 
 
@@ -278,15 +278,14 @@ function manual_make_folder() {
   let layer1Urls = [];
   let newlyCreatedLayer1Folders = [];
   let seenLayer1InThisRun = new Set();
-
+  
   for (let i = 0; i < folderData.length; i++) {
     let row = folderData[i];
-    
     let folder = folder_root;
     let currentPath = folder_id_root;
     let currentLayer1Url = ""; 
     let isNewLayer1 = false;
-
+    
     for (let j = 0; j < row.length; j++) {
       if (row[j] === "") continue;
       
@@ -294,12 +293,11 @@ function manual_make_folder() {
       if (!folder_name) continue;
 
       currentPath += "/" + folder_name;
-
+      
       if (folderCache[currentPath]) {
         folder = folderCache[currentPath];
       } else {
         let folders = folder.getFoldersByName(folder_name);
-        
         if (folders.hasNext()) {
           folder = folders.next();
         } else {
@@ -326,7 +324,7 @@ function manual_make_folder() {
   }
 
   sendSlackNotification(newlyCreatedLayer1Folders);
-
+  
   if (created_count === 0) {
     if (ui) ui.alert("処理完了（すべて作成済みでした）");
   } else {
@@ -381,7 +379,7 @@ function auto_make_folder_from_sf() {
 
   let parent_folder_url = rawFolderSheet.getRange("B1").getValue().toString().trim();
   let target_folder_name = rawFolderSheet.getRange("B2").getValue().toString().trim();
-
+  
   if (!parent_folder_url || parent_folder_url === "ここに入力" || !target_folder_name) {
     if (ui) ui.alert("raw_folderシートのB1（上位URL）またはB2（フォルダ名）が正しく入力されていません。");
     else console.warn("raw_folderの入力不備によりスキップされました。");
@@ -409,7 +407,7 @@ function auto_make_folder_from_sf() {
   }
   
   let folder_id_root = folder_root.getId();
-
+  
   const lastRow = mainSheet.getLastRow();
   if (lastRow >= 9) {
     mainSheet.getRange(9, 1, lastRow - 8, mainSheet.getLastColumn()).clearContent();
@@ -484,7 +482,7 @@ function auto_make_folder_from_sf() {
 
   const groups = {};
   let hasAnyGroupChanged = false;
-
+  
   for (let i = 1; i < sfData.length; i++) {
     const oppId = String(sfData[i][oppIdIndex]).trim();
     const oppName = sfData[i][nameIndex];
@@ -500,13 +498,13 @@ function auto_make_folder_from_sf() {
     const endVal = endIndex !== -1 ? formatCompareValue(sfData[i][endIndex]) : "";
     const prodVal = productIndex !== -1 ? formatCompareValue(sfData[i][productIndex]) : "";
     const suppVal = supplierIndex !== -1 ? formatCompareValue(sfData[i][supplierIndex]) : "";
-
+    
     // ★ セルに入力されている「既存のフォルダURL」を読み込む
     const existingUrl = sfData[i][urlColIndex] ? String(sfData[i][urlColIndex]).trim() : "";
-
+    
     // 確実に案件を紐付けるため、キーは商談IDベース
     const groupKey = oppId ? "OPPID_" + oppId : "PJC_" + pCode + "_" + oppName.replace(/\s/g, "");
-
+    
     if (!groups[groupKey]) {
       groups[groupKey] = {
         oppId: oppId,
@@ -524,7 +522,7 @@ function auto_make_folder_from_sf() {
       };
     }
 
-    groups[groupKey].rowIndexes.push(i + 1);
+    groups[groupKey].rowIndexes.push(i + 1); // 1-based index (シートの行番号)
 
     if (productIndex !== -1 && supplierIndex !== -1 && suppVal) {
       if (/[AＡ]/.test(prodVal)) {
@@ -537,6 +535,7 @@ function auto_make_folder_from_sf() {
     }
 
     const currentLineKey = `${pCode}🏎️${oppName}🏎️${startVal}🏎️${endVal}🏎️${prodVal}🏎️${suppVal}`;
+    
     if (!logSet.has(currentLineKey)) {
       groups[groupKey].isChanged = true;
       hasAnyGroupChanged = true;
@@ -560,18 +559,21 @@ function auto_make_folder_from_sf() {
   let allGeneratedData = [];
   let processedGroups = []; // あとでシートにURLを書き戻すために保持
   let no = 1;
-
+  
   for (const key in groups) {
     const group = groups[key];
     if (!group.isChanged) continue;
 
     let monthList = [];
+    
     if (group.rawStart && group.rawEnd) {
       let sDate = parseSafeDate(group.rawStart);
       let eDate = parseSafeDate(group.rawEnd);
+      
       if (sDate && eDate) {
         let currentMonth = new Date(sDate.getTime());
         currentMonth.setDate(1);
+        
         let endMonth = new Date(eDate.getTime());
         endMonth.setDate(1);
         while (currentMonth <= endMonth) {
@@ -582,14 +584,17 @@ function auto_make_folder_from_sf() {
     }
 
     const layer1 = `PJC：${group.projectCode}（商談名：${group.oppName}）`;
-
+    
     // ★ 核心処理：シートに既存URLが残っている場合は、IDから直接特定してリネーム実行
     if (group.folderUrl) {
       const urlMatch = group.folderUrl.match(/[-\w]{25,}/);
+      
       if (urlMatch) {
         const targetId = urlMatch[0];
+        
         try {
           let existingFolder = DriveApp.getFolderById(targetId);
+          
           // フォルダ名が最新の形式と異なる場合のみリネームを実行
           if (existingFolder.getName() !== layer1) {
             existingFolder.setName(layer1);
@@ -602,6 +607,7 @@ function auto_make_folder_from_sf() {
     }
 
     const result = buildLayerDataFromMaster(masterData, no, layer1, monthList, group.supplierA, group.supplierB, true);
+    
     const dynamicInjectedData = result.data.map(row => {
       let newRow = [...row];
       newRow.splice(1, 0, group.buName, group.deptName); 
@@ -657,6 +663,7 @@ function auto_make_folder_from_sf() {
     
     for (let j = 0; j < row.length; j++) {
       if (row[j] === "") continue;
+      
       let folder_name = String(row[j]).trim();
       if (!folder_name) continue;
 
@@ -692,24 +699,31 @@ function auto_make_folder_from_sf() {
     mainSheet.getRange(9, maxCol + 1, layer1Urls.length, 1).setValues(layer1Urls);
   }
 
-  // ★ 核心処理2：新しく作られた（またはリネームされた）最上位フォルダのURLを raw_SF_7DAYS の全該当行に書き戻す
+  // ★ 核心処理2(改善)：ループ内のsetValueを廃止し、配列上で更新してsetValuesで一括書き込み
+  const urlRange = sfSheet.getRange(1, urlColIndex + 1, sfData.length, 1);
+  const urlValues = urlRange.getValues(); // URL列全体のデータを2次元配列として取得
+
   processedGroups.forEach(group => {
     const latestLayer1Name = `PJC：${group.projectCode}（商談名：${group.oppName}）`;
     const latestUrl = layer1UrlMapByName[latestLayer1Name];
     if (latestUrl) {
       group.rowIndexes.forEach(rowIdx => {
-        sfSheet.getRange(rowIdx, urlColIndex + 1).setValue(latestUrl);
+        // rowIdxは1-based(行番号)なので、配列インデックスに合わせるため -1 する
+        urlValues[rowIdx - 1][0] = latestUrl;
       });
     }
   });
+
+  // 更新したURL配列をシートへ一括書き込み（API呼び出しを1回に削減）
+  urlRange.setValues(urlValues);
 
   sendSlackNotification(newlyCreatedLayer1Folders);
   
   if (sfData.length > 1) {
     sfSheet.getRange(2, statusIndex + 1, sfData.length - 1, 1).setValue("完了");
   }
-  SpreadsheetApp.flush(); 
-
+  SpreadsheetApp.flush();
+  
   logSheet.clear();
   const finalSfDataWithChange = sfSheet.getDataRange().getValues(); 
   logSheet.getRange(1, 1, finalSfDataWithChange.length, finalSfDataWithChange[0].length).setValues(finalSfDataWithChange);
