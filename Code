@@ -201,7 +201,7 @@ function sendSlackNotification(newFolders) {
 }
 
 // =========================================================
-// 【手動モード】個別フォルダ生成＆作成（現行維持・パターンB仕様）
+// 【手動モード】個別フォルダ生成＆作成（現行維持仕様）
 // =========================================================
 function manual_make_folder() {
   const ss = SpreadsheetApp.getActiveSpreadsheet();
@@ -352,7 +352,7 @@ function setNextTrigger() {
 }
 
 // =========================================================
-// 【自動モード】メイン関数（責務分割・タイムアウト対応版）
+// 【自動モード】メイン関数
 // =========================================================
 function auto_make_folder_from_sf() {
   const startTime = Date.now();
@@ -361,11 +361,11 @@ function auto_make_folder_from_sf() {
   // 処理開始時に過去の動的トリガーを掃除
   clearDynamicTriggers();
 
-  // 1. 環境初期化・バリデーション
+  // 1. 環境初期化・バリデーション (上期・下期のルートフォルダ取得)
   const env = initializeAutoEnvironment(ui);
   if (!env) return;
 
-  // 2. ログ解析による差分検知
+  // 2. ログ解析による差分検知 (上期/下期判定含む)
   const logSet = buildLogSet(env.logData);
   const { groups, hasAnyGroupChanged } = parseSfDataAndDetectChanges(env, logSet);
 
@@ -378,11 +378,11 @@ function auto_make_folder_from_sf() {
   const { allGeneratedData, groupsToProcess } = buildFolderHierarchyData(env, groups);
 
   if (allGeneratedData.length === 0) {
-    // データ実体の作成はないが、孤立データ（削除跡地）の掃除があるため同期を実行
+    // データ実体の作成はないが、孤立データの掃除があるため同期を実行
     syncUrlsAndStatuses(env, groups);
     
     if (groupsToProcess.length === 0) {
-      finalizeWithoutChanges(env, ui); // 変更なし（掃除のみ）として終了
+      finalizeWithoutChanges(env, ui); 
     } else {
       finalizeWithNoMasterMatch(env, ui);
     }
@@ -395,7 +395,7 @@ function auto_make_folder_from_sf() {
   // 4. フォルダの実体作成とURL取得（タイムアウト監視あり）
   const createResult = executeFolderCreation(env, allGeneratedData, groupsToProcess, startTime);
 
-  // 5. 新規作成分のSlack通知と、★SFシートへのURL・ステータス一括同期★
+  // 5. 新規作成分のSlack通知と、SFシートへのURL・ステータス一括同期
   syncUrlsAndStatuses(env, groups, createResult.layer1UrlMapByName);
   sendSlackNotification(createResult.newlyCreatedLayer1Folders);
 
@@ -411,6 +411,27 @@ function auto_make_folder_from_sf() {
 // サブ関数群（自動モード用）
 // =========================================================
 
+// ★ 新規追加: 指定URLと名前から親フォルダを取得（または作成）するヘルパー
+function getOrCreateRootFolder(ui, url, name, label) {
+  if (!url || url === "ここに入力" || !name) {
+    if (ui) ui.alert(`raw_folderシートの【${label}】用URLまたはフォルダ名が未入力です。`);
+    return null;
+  }
+  const match = url.match(/[-\w]{25,}/);
+  if (match) url = match[0];
+  
+  let parentFolder;
+  try {
+    parentFolder = DriveApp.getFolderById(url);
+  } catch (e) {
+    if (ui) ui.alert(`raw_folderシートの【${label}】用URLが正しくありません。`);
+    return null;
+  }
+
+  let targetFolders = parentFolder.getFoldersByName(name);
+  return targetFolders.hasNext() ? targetFolders.next() : parentFolder.createFolder(name);
+}
+
 function initializeAutoEnvironment(ui) {
   const ss = SpreadsheetApp.getActiveSpreadsheet();
   const mainSheet = ss.getSheetByName(CONFIG.SHEET_WORKSPACE);
@@ -425,25 +446,17 @@ function initializeAutoEnvironment(ui) {
     return null;
   }
 
-  let parent_folder_url = rawFolderSheet.getRange("B1").getValue().toString().trim();
-  let target_folder_name = rawFolderSheet.getRange("B2").getValue().toString().trim();
+  // ★ 上期・下期のルートフォルダをそれぞれ取得・作成
+  const url_kamiki = rawFolderSheet.getRange("B1").getValue().toString().trim();
+  const name_kamiki = rawFolderSheet.getRange("B2").getValue().toString().trim();
+  const url_shimoki = rawFolderSheet.getRange("B3").getValue().toString().trim();
+  const name_shimoki = rawFolderSheet.getRange("B4").getValue().toString().trim();
 
-  if (!parent_folder_url || !target_folder_name) {
-    if (ui) ui.alert("raw_folderシートのB1（上位URL）またはB2（フォルダ名）が未入力です。");
-    return null;
-  }
-  
-  const match = parent_folder_url.match(/[-\w]{25,}/);
-  if (match) parent_folder_url = match[0];
+  const folder_root_kamiki = getOrCreateRootFolder(ui, url_kamiki, name_kamiki, "上期(B1/B2)");
+  const folder_root_shimoki = getOrCreateRootFolder(ui, url_shimoki, name_shimoki, "下期(B3/B4)");
 
-  let folder_root;
-  try {
-    let parent_folder = DriveApp.getFolderById(parent_folder_url);
-    let targetFolders = parent_folder.getFoldersByName(target_folder_name);
-    folder_root = targetFolders.hasNext() ? targetFolders.next() : parent_folder.createFolder(target_folder_name);
-  } catch (e) {
-    if (ui) ui.alert("raw_folderシートのB1セルのURLが正しくありません。");
-    return null;
+  if (!folder_root_kamiki || !folder_root_shimoki) {
+    return null; // いずれかの取得に失敗したら中断
   }
 
   // Workspaceシートのクリア
@@ -487,7 +500,11 @@ function initializeAutoEnvironment(ui) {
     sfData[0][indices.url] = "格納先フォルダURL";
   }
 
-  return { ss, mainSheet, sfSheet, logSheet, sfData, logData, masterData, headers, indices, folder_root, folder_id_root: folder_root.getId() };
+  return { 
+    ss, mainSheet, sfSheet, logSheet, sfData, logData, masterData, headers, indices, 
+    folder_root_kamiki, folder_id_root_kamiki: folder_root_kamiki.getId(),
+    folder_root_shimoki, folder_id_root_shimoki: folder_root_shimoki.getId()
+  };
 }
 
 function buildLogSet(logData) {
@@ -527,10 +544,10 @@ function parseSfDataAndDetectChanges(env, logSet) {
     const existingUrl = sfData[i][indices.url] ? String(sfData[i][indices.url]).trim() : "";
     const existingStatus = sfData[i][indices.status] ? String(sfData[i][indices.status]).trim() : "";
     
-    // ★追加修正：商談名が消された（空欄になった）行に過去のURLや完了が残っているか検知
+    // 商談名が消された（空欄になった）行の掃除フラグ
     if (!oppName) {
       if (existingUrl || existingStatus) {
-        hasAnyGroupChanged = true; // 孤立データを掃除するために変更フラグを立てる
+        hasAnyGroupChanged = true; 
       }
       continue;
     }
@@ -544,6 +561,20 @@ function parseSfDataAndDetectChanges(env, logSet) {
     const prodVal = indices.product !== -1 ? formatCompareValue(sfData[i][indices.product]) : "";
     const suppVal = indices.supplier !== -1 ? formatCompareValue(sfData[i][indices.supplier]) : "";
 
+    // ★ 新機能：売上開始月から「上期(4-9月)」か「下期(10-3月)」かを判定
+    let isKamiki = true; // デフォルトは上期扱い
+    if (indices.start !== -1 && sfData[i][indices.start]) {
+      const startDate = parseSafeDate(sfData[i][indices.start]);
+      if (startDate) {
+        const month = startDate.getMonth() + 1; // 0始まりなので+1
+        if (month >= 4 && month <= 9) {
+          isKamiki = true;
+        } else {
+          isKamiki = false;
+        }
+      }
+    }
+
     const groupKey = oppId ? "OPPID_" + oppId : "PJC_" + pCode + "_" + oppName.replace(/\s/g, "");
 
     if (!groups[groupKey]) {
@@ -551,7 +582,8 @@ function parseSfDataAndDetectChanges(env, logSet) {
         projectCode: pCode, oppName: oppName, buName: buVal, deptName: deptVal,
         supplierA: [], supplierB: [],
         rawStart: sfData[i][indices.start] || null, rawEnd: sfData[i][indices.end] || null,
-        rowIndexes: [], folderUrl: existingUrl, isChanged: false 
+        rowIndexes: [], folderUrl: existingUrl, isChanged: false,
+        isKamiki: isKamiki // ★ 判定結果を記憶
       };
     }
 
@@ -633,7 +665,6 @@ function buildFolderHierarchyData(env, groups) {
 function writeWorkspaceData(mainSheet, allGeneratedData) {
   const maxCol = Math.max(...allGeneratedData.map(row => row.filter(cell => typeof cell !== 'object').length));
   const formattedData = allGeneratedData.map(row => {
-    // オブジェクト参照（_groupRef）を除外した純粋な配列にする
     let newRow = row.filter(cell => typeof cell !== 'object');
     while (newRow.length < maxCol) newRow.push(""); 
     return newRow;
@@ -650,12 +681,10 @@ function executeFolderCreation(env, allGeneratedData, groupsToProcess, startTime
   let seenLayer1InThisRun = new Set();
   const layer1UrlMapByName = {};
   
-  // 処理完了したグループを記録するセット
   const completedGroups = new Set();
   let isTimeout = false;
 
   for (let i = 0; i < allGeneratedData.length; i++) {
-    // 行データから関連グループを取得
     const currentGroup = allGeneratedData[i]._groupRef;
     
     // タイムアウトチェック
@@ -665,11 +694,12 @@ function executeFolderCreation(env, allGeneratedData, groupsToProcess, startTime
       break; 
     }
 
-    // 最初の列（No）、BU、部署 をスキップしてフォルダ階層データを処理
-    const row = allGeneratedData[i].slice(3).filter(cell => typeof cell !== 'object');
+    // ★修正：No列(index 0)だけを除外し、BU(index 1), 部署(index 2), PJC(index 3) をフォルダ階層として残す
+    const row = allGeneratedData[i].slice(1).filter(cell => typeof cell !== 'object');
     
-    let folder = env.folder_root;
-    let currentPath = env.folder_id_root; 
+    // 上期・下期に応じてルートフォルダを動的に切り替え
+    let folder = currentGroup.isKamiki ? env.folder_root_kamiki : env.folder_root_shimoki;
+    let currentPath = currentGroup.isKamiki ? env.folder_id_root_kamiki : env.folder_id_root_shimoki;
     let currentLayer1Url = ""; 
     let isNewLayer1 = false;
 
@@ -689,12 +719,14 @@ function executeFolderCreation(env, allGeneratedData, groupsToProcess, startTime
         } else {
           folder = folder.createFolder(folder_name);
           createdCount++;
-          if (j === 0) isNewLayer1 = true; // j=0はLayer1(商談名フォルダ)
+          // ★修正：j=0がBU、j=1が部署。j=2（3番目の階層）が本来の「PJC（商談名）」フォルダ
+          if (j === 2) isNewLayer1 = true; 
         }
         folderCache[currentPath] = folder;
       }
       
-      if (j === 0) {
+      // j=2（PJC階層）の時に、メインのURLとして保存・Slack通知の対象にする
+      if (j === 2) {
         currentLayer1Url = folder.getUrl();
         layer1UrlMapByName[folder_name] = currentLayer1Url; 
         if (isNewLayer1 && !seenLayer1InThisRun.has(folder_name)) {
@@ -704,7 +736,6 @@ function executeFolderCreation(env, allGeneratedData, groupsToProcess, startTime
       }
     }
     
-    // この行の処理が無事に終わった証として記録
     completedGroups.add(currentGroup);
   }
 
@@ -718,7 +749,7 @@ function executeFolderCreation(env, allGeneratedData, groupsToProcess, startTime
 }
 
 // =========================================================
-// ★ 新機能：URLとステータスの完全同期・クリーナー
+// URLとステータスの完全同期・クリーナー
 // =========================================================
 function syncUrlsAndStatuses(env, groups, layer1UrlMapByName = {}) {
   const urlRange = env.sfSheet.getRange(1, env.indices.url + 1, env.sfData.length, 1);
@@ -748,7 +779,7 @@ function syncUrlsAndStatuses(env, groups, layer1UrlMapByName = {}) {
     }
   }
 
-  // シートへ一括書き込み（孤立したデータ跡地はこの時点で自動的に空欄になる）
+  // シートへ一括書き込み
   urlRange.setValues(urlValues);
   statusRange.setValues(statusValues);
   SpreadsheetApp.flush();
@@ -778,7 +809,6 @@ function finalizeWithNoMasterMatch(env, ui) {
 // 途中保存（タイムアウト発生時）
 function handleTimeoutEnd(env, completedGroups, createdCount, ui) {
   if (completedGroups.length > 0) {
-    // 最新の状態（URL書き込み済）のデータを取得してログに書き込む
     const freshSfData = env.sfSheet.getDataRange().getValues();
     const appendData = [];
     completedGroups.forEach(group => {
@@ -787,7 +817,6 @@ function handleTimeoutEnd(env, completedGroups, createdCount, ui) {
       });
     });
     
-    // ログシートへの追記
     const startRow = env.logSheet.getLastRow() + 1;
     if (startRow === 1) {
       appendData.unshift(env.headers);
@@ -796,7 +825,6 @@ function handleTimeoutEnd(env, completedGroups, createdCount, ui) {
     SpreadsheetApp.flush();
   }
 
-  // 1分後に再開するトリガーをセット
   setNextTrigger();
 
   const msg = `⚠️ 処理時間が上限に達したため中断しました。\n今回新たに ${createdCount} 個のフォルダを作成しました。\n残りの未処理分は自動的に1分後に再開されます。`;
@@ -806,7 +834,6 @@ function handleTimeoutEnd(env, completedGroups, createdCount, ui) {
 
 // 全量保存（正常完了時）
 function finalizeSuccess(env, createdCount, ui) {
-  // 完全に終わったので、ログシートを真っ白にして現在の最新SFデータを全量コピー（1から書き直し）
   env.logSheet.clear();
   const finalData = env.sfSheet.getDataRange().getValues(); 
   env.logSheet.getRange(1, 1, finalData.length, finalData[0].length).setValues(finalData);
