@@ -802,13 +802,23 @@ function executeFolderCreationForGroup(env, groupGeneratedData) {
 
       currentPath += "/" + folder_name;
       
+      // 💡 修正箇所: キャッシュの有無に関わらず、K列から取得したfolderIdを優先してアクセスする
       if (j === 2 && currentGroup.folderUrl) {
         const folderId = extractCleanDriveId_(currentGroup.folderUrl);
-        if (folderId && env.folderCache[folderId]) {
-           folder = env.folderCache[folderId]; 
-           currentPath = folderId; 
-           currentLayer1Url = folder.getUrl(); 
-           continue;
+        if (folderId) {
+           try {
+             if (env.folderCache[folderId]) {
+               folder = env.folderCache[folderId]; 
+             } else {
+               folder = DriveApp.getFolderById(folderId);
+               env.folderCache[folderId] = folder;
+             }
+             currentPath = folderId; 
+             currentLayer1Url = folder.getUrl(); 
+             continue;
+           } catch (e) {
+             console.warn("K列のURL( " + folderId + " )へのアクセスに失敗しました。名前検索・新規作成へフォールバックします: " + e.message);
+           }
         }
       }
 
