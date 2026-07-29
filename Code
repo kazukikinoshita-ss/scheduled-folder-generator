@@ -7,13 +7,19 @@ const CONFIG = {
   SHEET_RAW_FOLDER: "raw_folder",
   SHEET_SF: "raw_SF",
   SHEET_LOG: "log_SF",
+  SHEET_ERROR_CACHE: "[システム]error_cache", // 独立したエラーキャッシュ用シート
   START_ROW: 9, // Workspaceシートのデータ書き込み開始行
-  TIME_LIMIT_MS: 3 * 60 * 1000 // 3分 (GASの6分制限対策用のタイムアウト閾値)
+  TIME_LIMIT_MS: 3.5 * 60 * 1000, // 3.5分 (GASの6分制限対策用のタイムアウト限界安全値)
+  API_SLEEP_MS: 100 // APIレート制限回避用ウェイト (0.1秒)
 };
 
 // =========================================================
 // スクリプトプロパティから安全にURLを取得
 // =========================================================
+/**
+ * スクリプトプロパティからSlackのWebhook URLを取得する
+ * @returns {string|null} Webhook URL
+ */
 function getSlackWebhookUrl() {
   return PropertiesService.getScriptProperties().getProperty('SLACK_WEBHOOK_URL');
 }
@@ -21,26 +27,79 @@ function getSlackWebhookUrl() {
 // =========================================================
 // ヘルパー関数: UIオブジェクトの安全な取得
 // =========================================================
+/**
+ * UIオブジェクトを安全に取得する（トリガー実行時はnullを返す）
+ * @returns {GoogleAppsScript.Base.Ui|null}
+ */
 function getSafeUi() {
   try {
     return SpreadsheetApp.getUi();
   } catch (e) {
-    return null; // トリガーなどのバックグラウンド実行時はnullを返す
+    return null; 
   }
 }
 
+/**
+ * スプレッドシートを開いた際にカスタムメニューを構築する
+ */
 function onOpen() {
   const ui = getSafeUi();
   if (!ui) return;
   const menu = ui.createMenu("スクリプト");
   menu.addItem("【手動】個別フォルダ生成＆作成", "manual_make_folder");
   menu.addItem("【自動】SFデータから一括作成", "auto_make_folder_from_sf");
+  menu.addItem("【監査】誤作成フォルダ検知", "startFolderAudit");
   menu.addToUi();
+}
+
+// =========================================================
+// URL・Google Drive IDの超堅牢抽出パーサー
+// =========================================================
+/**
+ * HTMLタグやURLエンコードされた文字列から純粋なGoogle Drive IDを正確に抽出する
+ * @param {any} rawInput - Salesforceから渡されたHTML文字列またはURL
+ * @returns {string|null} 抽出された純粋なGoogle Drive ID（抽出不能な場合はnull）
+ */
+function extractCleanDriveId_(rawInput) {
+  if (!rawInput) return null;
+  let str = String(rawInput).trim();
+  if (!str) return null;
+
+  try {
+    str = decodeURIComponent(str);
+  } catch (e) {
+    // デコード例外が発生した場合は元の文字列で続行
+  }
+
+  let mFolder = str.match(/folders\/([a-zA-Z0-9_-]{25,})/);
+  if (mFolder) return mFolder[1];
+
+  let mId = str.match(/[?&]id=([a-zA-Z0-9_-]{25,})/);
+  if (mId) return mId[1];
+
+  let mD = str.match(/\/d\/([a-zA-Z0-9_-]{25,})/);
+  if (mD) return mD[1];
+
+  let mGen = str.match(/([a-zA-Z0-9_-]{25,})/);
+  if (mGen) {
+    let matched = mGen[1];
+    if ((matched.startsWith("2F") || matched.startsWith("3D")) && matched.length > 30) {
+      matched = matched.substring(2);
+    }
+    return matched;
+  }
+
+  return null;
 }
 
 // =========================================================
 // 安全な日付変換と文字列平滑化関数
 // =========================================================
+/**
+ * 様々な形式の日付文字列や数値をパースし、安全にDateオブジェクトに変換する
+ * @param {any} val - 変換対象の値
+ * @returns {Date|null}
+ */
 function parseSafeDate(val) {
   if (val instanceof Date) {
     return isNaN(val.getTime()) ? null : val;
@@ -74,10 +133,14 @@ function parseSafeDate(val) {
     let day = matches[4] ? parseInt(matches[4], 10) : 1;
     return new Date(year, month, day);
   }
-  
   return null;
 }
 
+/**
+ * 差分比較用に値を平滑化（フォーマット）する
+ * @param {any} val - フォーマット対象の値
+ * @returns {string}
+ */
 function formatCompareValue(val) {
   let d = parseSafeDate(val);
   if (d) {
@@ -89,6 +152,9 @@ function formatCompareValue(val) {
 // =========================================================
 // マスタからリストを生成する共通ヘルパー
 // =========================================================
+/**
+ * マスタシートの定義に基づいて、フォルダ作成用の中間データを生成する
+ */
 function buildLayerDataFromMaster(masterData, startNo, layer1Name, monthList, supplierAInput, supplierBInput, isManual) {
   let generated = [];
   let no = startNo;
@@ -131,11 +197,8 @@ function buildLayerDataFromMaster(masterData, startNo, layer1Name, monthList, su
             } else if (/[yY][yY][yY][yY][mM][mM]/.test(String(val))) {
               val = String(val).replace(/[yY][yY][yY][yY][mM][mM]/g, monthList[m]);
             } else if (typeof val === 'string') {
-              if (currentType === "A") {
-                val = val.replace(/[仕仕][入入][先先][AＡ]/g, currentSupplier);
-              } else if (currentType === "B") {
-                val = val.replace(/[仕仕][入入][先先][BＢ]/g, currentSupplier);
-              }
+              if (currentType === "A") val = val.replace(/[仕仕][入入][先先][AＡ]/g, currentSupplier);
+              else if (currentType === "B") val = val.replace(/[仕仕][入入][先先][BＢ]/g, currentSupplier);
             }
             if (val !== "") newRow.push(val);
           }
@@ -150,11 +213,8 @@ function buildLayerDataFromMaster(masterData, startNo, layer1Name, monthList, su
           } else if (/[yY][yY][yY][yY][mM][mM]/.test(String(val))) {
             val = "";
           } else if (typeof val === 'string') {
-            if (currentType === "A") {
-              val = val.replace(/[仕仕][入入][先先][AＡ]/g, currentSupplier);
-            } else if (currentType === "B") {
-              val = val.replace(/[仕仕][入入][先先][BＢ]/g, currentSupplier);
-            }
+            if (currentType === "A") val = val.replace(/[仕仕][入入][先先][AＡ]/g, currentSupplier);
+            else if (currentType === "B") val = val.replace(/[仕仕][入入][先先][BＢ]/g, currentSupplier);
           }
           if (val !== "") newRow.push(val);
         }
@@ -168,8 +228,14 @@ function buildLayerDataFromMaster(masterData, startNo, layer1Name, monthList, su
 // =========================================================
 // Slack通知共通関数
 // =========================================================
-function sendSlackNotification(newFolders) {
-  if (newFolders.length === 0) return;
+/**
+ * Slackに作成結果または警告を通知する
+ */
+function sendSlackNotification(newFolders, duplicateErrors = [], skippedGroups = []) {
+  if (newFolders.length === 0 && duplicateErrors.length === 0 && skippedGroups.length === 0) {
+    console.log("通知対象がないため、Slack通知をスキップしました。");
+    return;
+  }
 
   const webhookUrl = getSlackWebhookUrl();
   if (!webhookUrl) {
@@ -177,14 +243,36 @@ function sendSlackNotification(newFolders) {
     return;
   }
 
-  let slackBody = `証憑フォルダが新規作成されました（計 ${newFolders.length} 件）\n` +
-                  `-----------------------------------\n`;
+  let slackBody = "";
+  
+  if (newFolders.length > 0) {
+    slackBody += `📁 証憑フォルダが新規作成されました（計 ${newFolders.length} 件）\n` +
+                 `-----------------------------------\n`;
+    newFolders.forEach((f) => {
+      slackBody += `${f.name}\n${f.url}\n\n`;
+    });
+    slackBody += `-----------------------------------\n`;
+  }
 
-  newFolders.forEach((f) => {
-    slackBody += `${f.name}\n${f.url}\n\n`;
-  });
+  if (duplicateErrors.length > 0) {
+    slackBody += `\n🚨 【警告】URL重複エラー（処理スキップ）\n` +
+                 `異なる商談間で同一のURLが指定されているため、以下の案件は処理をスキップしました。\nSalesforceのデータを確認してください。\n` +
+                 `-----------------------------------\n`;
+    duplicateErrors.forEach(err => {
+      slackBody += `・URL: ${err.url}\n  対象商談ID: ${err.oppIds.join(", ")}\n\n`;
+    });
+    slackBody += `-----------------------------------\n`;
+  }
 
-  slackBody += `-----------------------------------`;
+  if (skippedGroups.length > 0) {
+    slackBody += `\n⚠️ 【通知】マスタ生成条件不一致（対象外としてスキップ）\n` +
+                 `以下の案件はマスタの条件（仕入先など）を満たさなかったため、「対象外」として処理されました。\n` +
+                 `-----------------------------------\n`;
+    skippedGroups.forEach(g => {
+      slackBody += `・商談名: ${g.oppName} (PJC: ${g.projectCode})\n`;
+    });
+    slackBody += `-----------------------------------`;
+  }
 
   const options = {
     "method": "POST",
@@ -257,13 +345,16 @@ function manual_make_folder() {
   sheet.getRange(CONFIG.START_ROW, 1, formattedData.length, maxCol).setValues(formattedData);
   SpreadsheetApp.flush(); 
 
-  let folder_id_root = sheet.getRange("B1").getValue().toString().trim();
-  const match = folder_id_root.match(/[-\w]{25,}/);
-  if (match) folder_id_root = match[0];
+  let raw_folder_id = sheet.getRange("B1").getValue().toString().trim();
+  let folder_id_root = extractCleanDriveId_(raw_folder_id) || raw_folder_id;
 
   let folder_root;
   try {
     folder_root = DriveApp.getFolderById(folder_id_root);
+    if (folder_root.isTrashed()) {
+      if (ui) ui.alert("B1セルのルートフォルダがゴミ箱に入っています。");
+      return;
+    }
   } catch (e) {
     if (ui) ui.alert("B1セルのルートフォルダURLが正しくありません。");
     return;
@@ -294,8 +385,17 @@ function manual_make_folder() {
         folder = folderCache[currentPath];
       } else {
         let folders = folder.getFoldersByName(folder_name);
-        if (folders.hasNext()) {
-          folder = folders.next();
+        let foundFolder = null;
+        while (folders.hasNext()) {
+          let f = folders.next();
+          if (!f.isTrashed()) {
+            foundFolder = f;
+            break;
+          }
+        }
+
+        if (foundFolder) {
+          folder = foundFolder;
         } else {
           folder = folder.createFolder(folder_name);
           created_count++;
@@ -329,12 +429,18 @@ function manual_make_folder() {
 }
 
 // =========================================================
-// 【動的トリガー管理】タイムアウト時の継続実行用
+// 【動的トリガー管理】
 // =========================================================
+/**
+ * タイムアウト時に起動される再開用関数
+ */
 function continue_auto_make() {
   auto_make_folder_from_sf();
 }
 
+/**
+ * 登録されている動的トリガーをすべてクリアする
+ */
 function clearDynamicTriggers() {
   const triggers = ScriptApp.getProjectTriggers();
   for (let i = 0; i < triggers.length; i++) {
@@ -344,59 +450,200 @@ function clearDynamicTriggers() {
   }
 }
 
+/**
+ * 1分後に再開するための動的トリガーをセットする
+ */
 function setNextTrigger() {
   ScriptApp.newTrigger("continue_auto_make")
     .timeBased()
-    .after(60 * 1000) // 1分後に再開
+    .after(60 * 1000)
     .create();
 }
 
 // =========================================================
-// 【自動モード】メイン関数
+// 【自動モード】メイン関数 (★v1.10.8 メタデータ差分検知・自動リネーム対応版)
 // =========================================================
+/**
+ * SFデータから自動的にフォルダを生成するメイン処理
+ */
 function auto_make_folder_from_sf() {
+  // 1. 排他制御 (LockServiceによる同時起動・割り込み防止)
+  const lock = LockService.getScriptLock();
+  if (!lock.tryLock(10000)) { // 10秒待機して取得できなければスキップ
+    console.warn("他のバッチ処理が実行中のため、競合防止により今回の実行をスキップしました。");
+    return;
+  }
+
   const startTime = Date.now();
   const ui = getSafeUi();
   
   clearDynamicTriggers();
 
-  // 1. 環境初期化・バリデーション
-  const env = initializeAutoEnvironment(ui);
-  if (!env) return;
+  try {
+    // 2. 環境とキャッシュの初期化
+    const env = initializeAutoEnvironment(ui, startTime);
+    if (!env) return;
 
-  // 2. ログデータ解析（差分検知 ＋ LogからのURL抽出機能）
-  const { logSet, logUrlMap } = buildLogDataMaps(env.logData);
-  const { groups, hasAnyGroupChanged } = parseSfDataAndDetectChanges(env, logSet, logUrlMap);
+    // 【v1.10.8 改修】Salesforce ConnectorによるL/M列のズレ修復 ＋ ProjectCode/商談名変更の検知
+    healRawDataWithLog_(env);
 
-  if (!hasAnyGroupChanged) {
-    finalizeWithoutChanges(env, ui);
-    return;
-  }
+    const totalSfRows = env.sfValues.length - 1; 
+    if (totalSfRows <= 0) {
+      if (ui) ui.alert("処理対象のデータが存在しません。");
+      return;
+    }
 
-  // 3. フォルダ生成用階層データの構築（リネーム処理含む）
-  const { allGeneratedData, groupsToProcess } = buildFolderHierarchyData(env, groups);
+    const { logSet, logUrlMap } = buildLogDataMaps(env.logData);
+    
+    // 3. 全行を一括スキャンし、処理が必要な「To-Doリスト」を生成
+    // ※ sfData(生データ)ではなく、healRawDataWithLog_で修復済みの sfValues を使用します
+    const { groups, duplicateErrors } = parseSfDataAndDetectChangesAll(env, logSet, logUrlMap);
 
-  if (allGeneratedData.length === 0) {
-    syncUrlsAndStatuses(env, groups);
-    if (groupsToProcess.length === 0) finalizeWithoutChanges(env, ui); 
-    else finalizeWithNoMasterMatch(env, ui);
-    return;
-  }
+    const changedKeys = Object.keys(groups).filter(k => groups[k].isChanged);
+    const totalTargets = changedKeys.length;
 
-  writeWorkspaceData(env.mainSheet, allGeneratedData);
+    // 処理すべき対象がゼロなら即終了 (ただし修復による更新があれば保存)
+    if (totalTargets === 0) {
+      if (env.hasUpdates) {
+        env.sfSheet.getRange(1, 1, env.sfValues.length, env.sfValues[0].length).setValues(env.sfValues);
+        saveLogSheetSafely_(env.logSheet, env.sfValues);
+        SpreadsheetApp.flush();
+      }
+      finalizeSuccess(env, 0, totalSfRows, ui, duplicateErrors, true);
+      return;
+    }
 
-  // 4. フォルダの実体作成とURL取得（URL直接指定と名前検索のフォールバック）
-  const createResult = executeFolderCreation(env, allGeneratedData, groupsToProcess, startTime);
+    // 4. To-Doリストの消化（マイクロバッチ実行）
+    let newlyCreatedLayer1Folders = [];
+    let masterSkippedGroups = [];
+    let errorGroups = [];
+    let allGeneratedDataForWorkspace = [];
+    let processedCount = 0;
+    let skipCount = 0;
+    let errorCount = 0;
+    let isTimeout = false;
 
-  // 5. 新規作成分のSlack通知と、SFシートへのURL・ステータス一括同期
-  syncUrlsAndStatuses(env, groups, createResult.layer1UrlMapByName);
-  sendSlackNotification(createResult.newlyCreatedLayer1Folders);
+    for (let i = 0; i < totalTargets; i++) {
+      // タイムアウトチェック (3.5分限界安全値)
+      if (Date.now() - env.startTime > CONFIG.TIME_LIMIT_MS) {
+        isTimeout = true;
+        break;
+      }
 
-  // 6. 状態保存と終了処理
-  if (createResult.isTimeout) {
-    handleTimeoutEnd(env, createResult.completedGroups, createResult.createdCount, ui);
-  } else {
-    finalizeSuccess(env, createResult.createdCount, ui);
+      const key = changedKeys[i];
+      const group = groups[key];
+      const layer1 = `PJC：${group.projectCode}（商談名：${group.oppName}）`;
+      
+      // マスタ条件チェックを先に行い、対象外なら即スキップしてステータス更新
+      let monthList = buildMonthList(group);
+      const result = buildLayerDataFromMaster(env.masterData, 1, layer1, monthList, group.supplierA, group.supplierB, true);
+      
+      if (result.data.length === 0) {
+        masterSkippedGroups.push(group);
+        group.rowIndexes.forEach(rowIdx => {
+          const r = rowIdx - 1;
+          env.sfValues[r][env.indices.status] = "対象外";
+          env.hasUpdates = true;
+        });
+        processedCount++;
+        skipCount++;
+        continue;
+      }
+
+      // 堅牢な例外処理と Drive 通信実行
+      try {
+        let folderUrlObj = { url: group.folderUrl };
+        
+        if (!checkAndFixUrl(env, folderUrlObj, layer1)) {
+          env.newErrors.push([key]); 
+          group.rowIndexes.forEach(rowIdx => {
+            const r = rowIdx - 1;
+            env.sfValues[r][env.indices.status] = "エラー(無効URL)";
+            env.hasUpdates = true;
+          });
+          processedCount++;
+          errorCount++;
+          continue; 
+        }
+        
+        group.folderUrl = folderUrlObj.url;
+
+        const groupGeneratedData = result.data.map(row => {
+          let newRow = [...row];
+          newRow.splice(1, 0, group.buName, group.deptName); 
+          newRow._groupRef = group;
+          return newRow;
+        });
+
+        // ドライブ検索・フォルダ作成の実行
+        const createRes = executeFolderCreationForGroup(env, groupGeneratedData);
+        newlyCreatedLayer1Folders.push(...createRes.newFolders);
+        allGeneratedDataForWorkspace.push(...groupGeneratedData);
+
+        const latestUrl = createRes.layer1Url || group.folderUrl;
+        if (latestUrl) {
+          group.rowIndexes.forEach(rowIdx => {
+            const r = rowIdx - 1; 
+            env.sfValues[r][env.indices.url] = latestUrl;
+            env.sfValues[r][env.indices.status] = "完了";
+            env.hasUpdates = true;
+          });
+        }
+        processedCount++;
+      } catch (e) {
+        console.error(`Group ${key} failed: ${e.message}`);
+        errorGroups.push(group);
+        group.rowIndexes.forEach(rowIdx => {
+          const r = rowIdx - 1;
+          env.sfValues[r][env.indices.status] = "エラー(作成失敗)";
+          env.hasUpdates = true;
+        });
+        processedCount++;
+        errorCount++;
+      }
+
+      // APIレート制限回避のためのスロットリング (0.1秒)
+      Utilities.sleep(CONFIG.API_SLEEP_MS);
+    }
+
+    // 5. 処理結果の書き出し (Workspace, エラーキャッシュ)
+    if (allGeneratedDataForWorkspace.length > 0) {
+      writeWorkspaceData(env.mainSheet, allGeneratedDataForWorkspace);
+    }
+    flushBadUrls(env);
+
+    // raw_SF の一括更新 (修復されたズレデータを含む)
+    if (env.hasUpdates) {
+      env.sfSheet.getRange(1, 1, env.sfValues.length, env.sfValues[0].length).setValues(env.sfValues);
+      SpreadsheetApp.flush();
+    }
+
+    // 6. 終了判定とログ更新
+    if (isTimeout) {
+      // タイムアウト時も安全に log_SF を上書き同期
+      saveLogSheetSafely_(env.logSheet, env.sfValues);
+
+      const remain = totalTargets - processedCount;
+      const msg = `⚠️ 処理時間が上限（3.5分）に達したため中断しました。\n` +
+                  `📊 【全体進捗】: 対象タスク ${totalTargets} 件中、${processedCount} 件処理完了。\n` +
+                  ` （内訳: フォルダ作成/確認 ${processedCount - skipCount - errorCount}件, 対象外スキップ ${skipCount}件, エラー ${errorCount}件）\n` +
+                  `未処理の残りタスク: ${remain} 件\n` +
+                  `今回新たに ${newlyCreatedLayer1Folders.length} 個のフォルダを作成しました。\n` +
+                  `残りの未処理分は自動的に1分後に再開されます。`;
+                  
+      if (ui) ui.alert(msg); 
+      else console.log(msg);
+      
+      setNextTrigger();
+    } else {
+      // 完走時
+      sendSlackNotification(newlyCreatedLayer1Folders, duplicateErrors, masterSkippedGroups);
+      finalizeSuccess(env, newlyCreatedLayer1Folders.length, totalSfRows, ui, duplicateErrors, false);
+    }
+
+  } finally {
+    // ロックの確実な解放
+    lock.releaseLock();
   }
 }
 
@@ -404,27 +651,246 @@ function auto_make_folder_from_sf() {
 // サブ関数群（自動モード用）
 // =========================================================
 
-function getOrCreateRootFolder(ui, url, name, label) {
-  if (!url || url === "ここに入力" || !name) {
-    if (ui) ui.alert(`raw_folderシートの【${label}】用URLまたはフォルダ名が未入力です。`);
-    return null;
-  }
-  const match = url.match(/[-\w]{25,}/);
-  if (match) url = match[0];
-  
-  let parentFolder;
-  try {
-    parentFolder = DriveApp.getFolderById(url);
-  } catch (e) {
-    if (ui) ui.alert(`raw_folderシートの【${label}】用URLが正しくありません。`);
-    return null;
+/**
+ * 【v1.10.8 追加ロジック】
+ * Salesforce Connectorによる行のズレを解消するとともに、
+ * 過去の履歴(log_SF)と現在のメタデータ(ProjectCode/商談名)を比較し、
+ * 変更があれば強制的に更新対象（リネーム処理対象）とする。
+ */
+function healRawDataWithLog_(env) {
+  const { sfValues, logData, indices } = env;
+  if (!logData || logData.length <= 1) return; 
+
+  const logHeaders = logData[0];
+  const logIdx = {
+    oppId: logHeaders.findIndex(h => String(h).replace(/\s/g, "").includes("商談ID") || String(h).replace(/\s/g, "").toLowerCase().includes("opportunityid")),
+    pCode: logHeaders.findIndex(h => String(h).replace(/\s/g, "").toLowerCase().includes("projectcode") || String(h).replace(/\s/g, "").includes("プロジェクトコード")),
+    name: logHeaders.findIndex(h => String(h).replace(/\s/g, "").includes("商谈名") || String(h).replace(/\s/g, "").includes("商談名")),
+    status: logHeaders.indexOf("自動作成ステータス"),
+    url: logHeaders.indexOf("格納先フォルダURL")
+  };
+
+  if (logIdx.oppId === -1) return; // ログ側に商談IDが見つからない場合は修復不能としてリターン
+
+  // logDataから商談IDをキーとした履歴(絶対的な真実)マップを作成
+  const logMap = {};
+  for (let r = 1; r < logData.length; r++) {
+    const oppId = String(logData[r][logIdx.oppId]).trim();
+    if (oppId) {
+      logMap[oppId] = {
+        status: logIdx.status !== -1 ? (logData[r][logIdx.status] || "") : "",
+        url: logIdx.url !== -1 ? (logData[r][logIdx.url] || "") : "",
+        pCode: logIdx.pCode !== -1 ? String(logData[r][logIdx.pCode]).trim() : "",
+        name: logIdx.name !== -1 ? String(logData[r][logIdx.name]).trim() : ""
+      };
+    }
   }
 
-  let targetFolders = parentFolder.getFoldersByName(name);
-  return targetFolders.hasNext() ? targetFolders.next() : parentFolder.createFolder(name);
+  // sfValues (raw_SFのコピー) をスキャンして修復および差分検知を実行
+  for (let i = 1; i < sfValues.length; i++) {
+    const oppId = String(sfValues[i][indices.oppId]).trim();
+    if (!oppId) continue;
+
+    if (logMap[oppId]) {
+      // 現在の生データ（raw_SF）のProjectCodeと商談名
+      const rawPCode = indices.pCode !== -1 ? String(sfValues[i][indices.pCode]).trim() : "";
+      const rawName = indices.name !== -1 ? String(sfValues[i][indices.name]).trim() : "";
+      // ログデータ（log_SF）に記録されている前回のProjectCodeと商談名
+      const logPCode = logMap[oppId].pCode;
+      const logName = logMap[oppId].name;
+
+      // メタデータに変更があるか（事後発番や名称変更）をチェック
+      if (rawPCode !== logPCode || rawName !== logName) {
+        // 💡 変更検知 (Change Data Capture)
+        // URLは維持しつつ、ステータスを意図的に空欄にすることで強制的に更新(リネーム)処理へ回す
+        sfValues[i][indices.status] = ""; 
+        sfValues[i][indices.url] = logMap[oppId].url;
+      } else {
+        // 💡 変更なし・完全一致
+        // ステータスとURLを元通りに修復し、不要なAPI通信をスキップさせる
+        sfValues[i][indices.status] = logMap[oppId].status;
+        sfValues[i][indices.url] = logMap[oppId].url;
+      }
+    } else {
+      // 履歴にない(真に新規の案件)場合は、ズレによって残っていたゴミデータをクリアする
+      sfValues[i][indices.status] = "";
+      sfValues[i][indices.url] = "";
+    }
+  }
+  
+  // メモリ上で修復・更新を行ったため、最終的にシートへ書き戻すフラグを立てておく
+  env.hasUpdates = true; 
 }
 
-function initializeAutoEnvironment(ui) {
+/**
+ * グループの日付情報から処理対象の月リストを生成する
+ */
+function buildMonthList(group) {
+  let monthList = [];
+  if (group.rawStart && group.rawEnd) {
+    let sDate = parseSafeDate(group.rawStart); 
+    let eDate = parseSafeDate(group.rawEnd);
+    if (sDate && eDate) {
+      let currentMonth = new Date(sDate.getTime()); 
+      currentMonth.setDate(1);
+      let endMonth = new Date(eDate.getTime()); 
+      endMonth.setDate(1);
+      while (currentMonth <= endMonth) {
+        monthList.push(Utilities.formatDate(currentMonth, Session.getScriptTimeZone(), "yyyyMM"));
+        currentMonth.setMonth(currentMonth.getMonth() + 1);
+      }
+    }
+  }
+  return monthList;
+}
+
+/**
+ * フォルダURLの有効性を検証し、無効であればエラー記録を行う
+ * ※既存フォルダの名前が異なる場合はここで自動リネームが実行される
+ * @returns {boolean} 有効に処理を続行できる場合はtrue、無効（スキップすべき）場合はfalse
+ */
+function checkAndFixUrl(env, folderUrlObj, layer1Name) {
+  if (!folderUrlObj.url) return true;
+  
+  const folderId = extractCleanDriveId_(folderUrlObj.url);
+  if (!folderId) return true;
+  
+  if (env.skipCacheMap[folderId]) {
+    folderUrlObj.url = ""; 
+    return true;
+  }
+  
+  try {
+    let existingFolder = DriveApp.getFolderById(folderId);
+    if (existingFolder.isTrashed()) {
+      env.newErrors.push([folderId]); 
+      folderUrlObj.url = ""; // ゴミ箱にある場合はURLをクリアして新規作成へフォールバック
+    } else {
+      // 💡 リネーム処理: 現在のフォルダ名とマスタから生成した期待値(layer1Name)が異なれば更新
+      if (existingFolder.getName() !== layer1Name) {
+        existingFolder.setName(layer1Name);
+      }
+    }
+    return true;
+  } catch (e) {
+    env.newErrors.push([folderId]); 
+    folderUrlObj.url = ""; 
+    return true;
+  }
+}
+
+/**
+ * 単一のグループ（商談）に対してフォルダを生成する (ゴミ箱検証付き)
+ */
+function executeFolderCreationForGroup(env, groupGeneratedData) {
+  let currentLayer1Url = "";
+  let newFolders = [];
+  const currentGroup = groupGeneratedData[0]._groupRef;
+  let seenLayer1 = new Set();
+  
+  for (let i = 0; i < groupGeneratedData.length; i++) {
+    const row = groupGeneratedData[i].slice(1).filter(cell => typeof cell !== 'object');
+    let folder = currentGroup.isKamiki ? env.folder_root_kamiki : env.folder_root_shimoki;
+    let currentPath = folder.getId();
+    let isNewLayer1 = false;
+
+    for (let j = 0; j < row.length; j++) {
+      if (row[j] === "") continue;
+      
+      let folder_name = String(row[j]).trim();
+      if (!folder_name) continue;
+
+      currentPath += "/" + folder_name;
+      
+      if (j === 2 && currentGroup.folderUrl) {
+        const folderId = extractCleanDriveId_(currentGroup.folderUrl);
+        if (folderId && env.folderCache[folderId]) {
+           folder = env.folderCache[folderId]; 
+           currentPath = folderId; 
+           currentLayer1Url = folder.getUrl(); 
+           continue;
+        }
+      }
+
+      if (env.folderCache[currentPath]) {
+        folder = env.folderCache[currentPath];
+      } else {
+        let folders = folder.getFoldersByName(folder_name);
+        let foundFolder = null;
+        while (folders.hasNext()) {
+          let f = folders.next();
+          if (!f.isTrashed()) { 
+            foundFolder = f; 
+            break; 
+          }
+        }
+        
+        if (foundFolder) {
+          folder = foundFolder;
+        } else {
+          folder = folder.createFolder(folder_name);
+          if (j === 2) isNewLayer1 = true; 
+        }
+        
+        env.folderCache[currentPath] = folder;
+        if (j === 2) env.folderCache[folder.getId()] = folder;
+      }
+      
+      if (j === 2) {
+        currentLayer1Url = folder.getUrl();
+        if (isNewLayer1 && !seenLayer1.has(folder_name)) {
+          newFolders.push({ name: folder_name, url: currentLayer1Url });
+          seenLayer1.add(folder_name);
+        }
+      }
+    }
+  }
+  return { layer1Url: currentLayer1Url, newFolders: newFolders };
+}
+
+/**
+ * 新たに検知したエラー（無効URLやスキップキー）をキャッシュシートに書き出す
+ */
+function flushBadUrls(env) {
+  if (env.newErrors && env.newErrors.length > 0) {
+    const uniqueIds = [...new Set(env.newErrors.map(e => e[0]))];
+    const appendData = uniqueIds.map(id => [id]);
+    const lastRow = env.errorCacheSheet.getLastRow();
+    env.errorCacheSheet.getRange(lastRow + 1, 1, appendData.length, 1).setValues(appendData);
+    env.newErrors = []; 
+    SpreadsheetApp.flush();
+  }
+}
+
+/**
+ * ルートフォルダを安全に取得または作成する (ゴミ箱チェック付き)
+ */
+function getOrCreateRootFolder(ui, url, name, label) {
+  if (!url || url === "ここに入力" || !name) {
+    if (ui) ui.alert(`raw_folderシートの【${label}】用URLまたはフォルダ名が未入力です。`); 
+    return null;
+  }
+  const folderId = extractCleanDriveId_(url) || url;
+  
+  try {
+    let parentFolder = DriveApp.getFolderById(folderId);
+    if (parentFolder.isTrashed()) return null;
+    let targetFolders = parentFolder.getFoldersByName(name);
+    while (targetFolders.hasNext()) {
+      let f = targetFolders.next();
+      if (!f.isTrashed()) return f;
+    }
+    return parentFolder.createFolder(name);
+  } catch (e) {
+    if (ui) ui.alert(`raw_folderシートの【${label}】用URLが不正、またはアクセス権がありません。`); 
+    return null;
+  }
+}
+
+/**
+ * 実行環境、シートデータ、エラーキャッシュを初期化する
+ */
+function initializeAutoEnvironment(ui, startTime) {
   const ss = SpreadsheetApp.getActiveSpreadsheet();
   const mainSheet = ss.getSheetByName(CONFIG.SHEET_WORKSPACE);
   const masterSheet = ss.getSheetByName(CONFIG.SHEET_MASTER);
@@ -432,32 +898,41 @@ function initializeAutoEnvironment(ui) {
   const sfSheet = ss.getSheetByName(CONFIG.SHEET_SF);
   let logSheet = ss.getSheetByName(CONFIG.SHEET_LOG) || ss.insertSheet(CONFIG.SHEET_LOG);
 
-  if (!mainSheet || !masterSheet || !rawFolderSheet || !sfSheet) {
-    const msg = "必要なシートが見つかりません。設定を確認してください。";
-    if (ui) ui.alert(msg); else console.error(msg);
-    return null;
-  }
+  if (!mainSheet || !masterSheet || !rawFolderSheet || !sfSheet) return null;
 
   const url_kamiki = rawFolderSheet.getRange("B1").getValue().toString().trim();
   const name_kamiki = rawFolderSheet.getRange("B2").getValue().toString().trim();
   const url_shimoki = rawFolderSheet.getRange("B3").getValue().toString().trim();
   const name_shimoki = rawFolderSheet.getRange("B4").getValue().toString().trim();
 
-  const folder_root_kamiki = getOrCreateRootFolder(ui, url_kamiki, name_kamiki, "上期(B1/B2)");
-  const folder_root_shimoki = getOrCreateRootFolder(ui, url_shimoki, name_shimoki, "下期(B3/B4)");
-
+  const folder_root_kamiki = getOrCreateRootFolder(ui, url_kamiki, name_kamiki, "上期");
+  const folder_root_shimoki = getOrCreateRootFolder(ui, url_shimoki, name_shimoki, "下期");
   if (!folder_root_kamiki || !folder_root_shimoki) return null; 
 
-  const lastRow = mainSheet.getLastRow();
-  if (lastRow >= CONFIG.START_ROW) {
-    mainSheet.getRange(CONFIG.START_ROW, 1, lastRow - (CONFIG.START_ROW - 1), mainSheet.getLastColumn()).clearContent();
+  let errorCacheSheet = ss.getSheetByName(CONFIG.SHEET_ERROR_CACHE);
+  if (!errorCacheSheet) {
+    errorCacheSheet = ss.insertSheet(CONFIG.SHEET_ERROR_CACHE);
+    errorCacheSheet.hideSheet(); 
+    errorCacheSheet.getRange("A1").setValue("無効キャッシュキー");
+    errorCacheSheet.setFrozenRows(1);
+  }
+
+  let skipCacheMap = {};
+  const cacheLastRow = errorCacheSheet.getLastRow();
+  if (cacheLastRow > 1) {
+    const cacheData = errorCacheSheet.getRange(2, 1, cacheLastRow - 1, 1).getValues();
+    cacheData.forEach(row => { 
+      if (row[0]) {
+        let key = String(row[0]).trim();
+        if (!key.startsWith("2F") && !key.startsWith("3D")) {
+          skipCacheMap[key] = true; 
+        }
+      }
+    });
   }
 
   const sfData = sfSheet.getDataRange().getValues();
-  const logData = logSheet.getDataRange().getValues();
-  const masterData = masterSheet.getDataRange().getValues();
   const headers = sfData[0];
-
   const indices = {
     oppId: headers.findIndex(h => String(h).replace(/\s/g, "").includes("商談ID") || String(h).replace(/\s/g, "").toLowerCase().includes("opportunityid")),
     pCode: headers.findIndex(h => String(h).replace(/\s/g, "").toLowerCase().includes("projectcode") || String(h).replace(/\s/g, "").includes("プロジェクトコード")),
@@ -468,51 +943,50 @@ function initializeAutoEnvironment(ui) {
     supplier: headers.findIndex(h => String(h).replace(/\s/g, "").includes("仕入先")),
     bu: headers.findIndex(h => String(h).replace(/\s/g, "").toLowerCase().includes("businessunit")),
     dept: headers.findIndex(h => String(h).replace(/\s/g, "").includes("計上部署")),
-    // ★追加: Salesforce連携のファイルストレージ(URL)の列を取得
     sfStorageUrl: headers.findIndex(h => String(h).replace(/\s/g, "").includes("ファイルストレージ(URL)")),
     status: headers.indexOf("自動作成ステータス"),
     url: headers.indexOf("格納先フォルダURL")
   };
 
-  if (indices.oppId === -1 || indices.pCode === -1 || indices.name === -1 || indices.bu === -1 || indices.dept === -1) {
-    if (ui) ui.alert("必須列が見つかりません。処理を中断します。");
-    return null;
-  }
-
   if (indices.status === -1) {
     indices.status = headers.length;
-    sfSheet.getRange(1, indices.status + 1).setValue("自動作成ステータス");
+    sfSheet.getRange(1, indices.status + 1).setValue("自動作成ステータス"); 
+    headers.push("自動作成ステータス");
+    for (let i = 1; i < sfData.length; i++) sfData[i].push("");
   }
-
+  
   if (indices.url === -1) {
-    indices.url = sfSheet.getLastColumn();
-    sfSheet.getRange(1, indices.url + 1).setValue("格納先フォルダURL");
-    sfData[0][indices.url] = "格納先フォルダURL";
+    indices.url = headers.length;
+    sfSheet.getRange(1, indices.url + 1).setValue("格納先フォルダURL"); 
+    headers.push("格納先フォルダURL");
+    for (let i = 1; i < sfData.length; i++) sfData[i].push("");
   }
 
   return { 
-    ss, mainSheet, sfSheet, logSheet, sfData, logData, masterData, headers, indices, 
-    folder_root_kamiki, folder_id_root_kamiki: folder_root_kamiki.getId(),
-    folder_root_shimoki, folder_id_root_shimoki: folder_root_shimoki.getId()
+    ss, mainSheet, sfSheet, logSheet, errorCacheSheet, 
+    sfData, logData: logSheet.getDataRange().getValues(), masterData: masterSheet.getDataRange().getValues(), 
+    headers, indices, folder_root_kamiki, folder_root_shimoki, startTime, 
+    skipCacheMap, newErrors: [], sfValues: sfData.map(r => [...r]), hasUpdates: false, folderCache: {}
   };
 }
 
+/**
+ * ログシートから既存の作成済みデータを抽出し、比較用マップを作成する
+ */
 function buildLogDataMaps(logData) {
   const logSet = new Set();
   const logUrlMap = {}; 
-  
   if (logData.length <= 1) return { logSet, logUrlMap };
-
-  const logHeaders = logData[0];
+  
   const idx = {
-    oppId: logHeaders.findIndex(h => String(h).replace(/\s/g, "").includes("商談ID") || String(h).replace(/\s/g, "").toLowerCase().includes("opportunityid")),
-    pCode: logHeaders.findIndex(h => String(h).replace(/\s/g, "").toLowerCase().includes("projectcode")),
-    name: logHeaders.findIndex(h => String(h).replace(/\s/g, "").includes("商談名")),
-    start: logHeaders.findIndex(h => String(h).replace(/\s/g, "").includes("売上開始月")),
-    end: logHeaders.findIndex(h => String(h).replace(/\s/g, "").includes("売上終了月")),
-    product: logHeaders.findIndex(h => String(h).replace(/\s/g, "").includes("商品")),
-    supplier: logHeaders.findIndex(h => String(h).replace(/\s/g, "").includes("仕入先")),
-    url: logHeaders.indexOf("格納先フォルダURL") 
+    oppId: logData[0].findIndex(h => String(h).replace(/\s/g, "").includes("商談ID") || String(h).replace(/\s/g, "").toLowerCase().includes("opportunityid")),
+    pCode: logData[0].findIndex(h => String(h).replace(/\s/g, "").toLowerCase().includes("projectcode")),
+    name: logData[0].findIndex(h => String(h).replace(/\s/g, "").includes("商談名")),
+    start: logData[0].findIndex(h => String(h).replace(/\s/g, "").includes("売上開始月")),
+    end: logData[0].findIndex(h => String(h).replace(/\s/g, "").includes("売上終了月")),
+    product: logData[0].findIndex(h => String(h).replace(/\s/g, "").includes("商品")),
+    supplier: logData[0].findIndex(h => String(h).replace(/\s/g, "").includes("仕入先")),
+    url: logData[0].indexOf("格納先フォルダURL") 
   };
   
   for (let i = 1; i < logData.length; i++) {
@@ -522,168 +996,132 @@ function buildLogDataMaps(logData) {
     const e = idx.end !== -1 ? formatCompareValue(logData[i][idx.end]) : "";
     const pr = idx.product !== -1 ? formatCompareValue(logData[i][idx.product]) : "";
     const su = idx.supplier !== -1 ? formatCompareValue(logData[i][idx.supplier]) : "";
+    
     logSet.add(`${p}🏎️${n}🏎️${s}🏎️${e}🏎️${pr}🏎️${su}`);
-
+    
     if (idx.oppId !== -1 && idx.url !== -1) {
-      const oppIdStr = String(logData[i][idx.oppId]).trim();
+      const oppIdStr = String(logData[i][idx.oppId]).trim(); 
       const urlStr = String(logData[i][idx.url]).trim();
-      if (oppIdStr && urlStr) {
-        logUrlMap[oppIdStr] = urlStr;
-      }
+      if (oppIdStr && urlStr) logUrlMap[oppIdStr] = urlStr;
     }
   }
   return { logSet, logUrlMap };
 }
 
-// ★修正：SalesforceのHTMLタグからURLを正確に抽出するロジックに強化
-function parseSfDataAndDetectChanges(env, logSet, logUrlMap) {
-  const { sfData, indices } = env;
+/**
+ * 修復済みの全行データをスキャンし、処理が必要なタスク（To-Doリスト）を抽出する
+ */
+function parseSfDataAndDetectChangesAll(env, logSet, logUrlMap) {
+  // ※ 修復済みの env.sfValues を使用する
+  const { sfValues, indices } = env;
   const groups = {};
-  let hasAnyGroupChanged = false;
+  const duplicateUrlMap = {}; 
+  const duplicateErrors = []; 
 
-  for (let i = 1; i < sfData.length; i++) {
-    const oppId = String(sfData[i][indices.oppId]).trim();
-    const oppName = sfData[i][indices.name];
+  // 重複チェック
+  for (let i = 1; i < sfValues.length; i++) {
+    const oppId = String(sfValues[i][indices.oppId]).trim();
+    if (!oppId) continue;
     
-    // SF連携のファイルストレージ(URL)を取得
-    let rawSfStorageUrl = (indices.sfStorageUrl !== -1 && sfData[i][indices.sfStorageUrl]) ? String(sfData[i][indices.sfStorageUrl]).trim() : "";
-    
-    // SalesforceのHTMLタグ（<a href="...">）から、正規のDrive URLを抽出する
+    let rawSfStorageUrl = (indices.sfStorageUrl !== -1 && sfValues[i][indices.sfStorageUrl]) ? String(sfValues[i][indices.sfStorageUrl]).trim() : "";
     if (rawSfStorageUrl) {
-      // 1. まず "https://drive.google.com/drive/folders/ID" の形がそのまま入っているか探す
-      const urlMatch = rawSfStorageUrl.match(/https:\/\/drive\.google\.com\/drive\/folders\/[-\w]{25,}/);
-      if (urlMatch) {
-        rawSfStorageUrl = urlMatch[0]; // 綺麗なURLだけを切り抜く
-      } else {
-        // 2. 万が一見つからなかった場合の保険として、ID（25文字以上の英数字と記号）だけを抽出してURLを組み立てる
-        const idMatch = rawSfStorageUrl.match(/[-\w]{25,}/); 
-        if (idMatch) {
-          rawSfStorageUrl = "https://drive.google.com/drive/folders/" + idMatch[0];
-        } else {
-          rawSfStorageUrl = ""; // 有効なIDがなければ空にする
-        }
-      }
+      const extractedId = extractCleanDriveId_(rawSfStorageUrl);
+      rawSfStorageUrl = extractedId ? "https://drive.google.com/drive/folders/" + extractedId : "";
     }
-
-    const rawGasUrl = sfData[i][indices.url] ? String(sfData[i][indices.url]).trim() : "";
-    const existingStatus = sfData[i][indices.status] ? String(sfData[i][indices.status]).trim() : "";
     
-    if (!oppName) {
-      if (rawSfStorageUrl || rawGasUrl || existingStatus) hasAnyGroupChanged = true; 
-      continue;
+    let determinedUrl = rawSfStorageUrl || logUrlMap[oppId] || "";
+    if (determinedUrl) {
+      if (!duplicateUrlMap[determinedUrl]) duplicateUrlMap[determinedUrl] = new Set();
+      duplicateUrlMap[determinedUrl].add(oppId);
     }
+  }
+  
+  for (const url in duplicateUrlMap) {
+    if (duplicateUrlMap[url].size > 1) duplicateErrors.push({ url: url, oppIds: Array.from(duplicateUrlMap[url]) });
+  }
 
-    // 優先順位: 1. SF連携のファイルストレージ(URL) -> 2. GAS生成URL -> 3. LogのURL
-    let determinedUrl = "";
-    if (rawSfStorageUrl) determinedUrl = rawSfStorageUrl;
-    else if (rawGasUrl) determinedUrl = rawGasUrl;
-    else if (logUrlMap[oppId]) determinedUrl = logUrlMap[oppId];
-    
-    let pCode = sfData[i][indices.pCode] ? String(sfData[i][indices.pCode]).trim() : "SFXXXXXXXX";
-    const buVal = String(sfData[i][indices.bu]).trim() || "BU未指定";
-    const deptVal = String(sfData[i][indices.dept]).trim() || "部署未指定";
+  // 差分評価（To-Do抽出）
+  for (let i = 1; i < sfValues.length; i++) {
+    const oppId = String(sfValues[i][indices.oppId]).trim();
+    const oppName = sfValues[i][indices.name];
+    if (!oppName) continue;
 
-    const startVal = indices.start !== -1 ? formatCompareValue(sfData[i][indices.start]) : "";
-    const endVal = indices.end !== -1 ? formatCompareValue(sfData[i][indices.end]) : "";
-    const prodVal = indices.product !== -1 ? formatCompareValue(sfData[i][indices.product]) : "";
-    const suppVal = indices.supplier !== -1 ? formatCompareValue(sfData[i][indices.supplier]) : "";
-
-    let isKamiki = true; 
-    if (indices.start !== -1 && sfData[i][indices.start]) {
-      const startDate = parseSafeDate(sfData[i][indices.start]);
-      if (startDate) {
-        const month = startDate.getMonth() + 1; 
-        if (month >= 4 && month <= 9) isKamiki = true;
-        else isKamiki = false;
-      }
-    }
-
+    let pCode = sfValues[i][indices.pCode] ? String(sfValues[i][indices.pCode]).trim() : "SFXXXXXXXX";
     const groupKey = oppId ? "OPPID_" + oppId : "PJC_" + pCode + "_" + oppName.replace(/\s/g, "");
 
+    if (env.skipCacheMap[groupKey]) continue;
+
+    let rawSfStorageUrl = (indices.sfStorageUrl !== -1 && sfValues[i][indices.sfStorageUrl]) ? String(sfValues[i][indices.sfStorageUrl]).trim() : "";
+    if (rawSfStorageUrl) {
+      const extractedId = extractCleanDriveId_(rawSfStorageUrl);
+      rawSfStorageUrl = extractedId ? "https://drive.google.com/drive/folders/" + extractedId : "";
+    }
+    
+    let determinedUrl = rawSfStorageUrl || logUrlMap[oppId] || "";
+    const cleanId = extractCleanDriveId_(determinedUrl);
+    if (cleanId && env.skipCacheMap[cleanId]) continue;
+
+    const existingStatus = sfValues[i][indices.status] ? String(sfValues[i][indices.status]).trim() : "";
+    
     if (!groups[groupKey]) {
       groups[groupKey] = {
-        projectCode: pCode, oppName: oppName, buName: buVal, deptName: deptVal,
-        supplierA: [], supplierB: [],
-        rawStart: sfData[i][indices.start] || null, rawEnd: sfData[i][indices.end] || null,
-        rowIndexes: [], folderUrl: determinedUrl, isChanged: false,
-        isKamiki: isKamiki 
+        projectCode: pCode, 
+        oppName: oppName, 
+        buName: String(sfValues[i][indices.bu]).trim() || "BU未指定", 
+        deptName: String(sfValues[i][indices.dept]).trim() || "部署未指定",
+        supplierA: [], 
+        supplierB: [], 
+        rawStart: sfValues[i][indices.start] || null, 
+        rawEnd: sfValues[i][indices.end] || null,
+        rowIndexes: [], 
+        folderUrl: determinedUrl, 
+        isChanged: false, 
+        isKamiki: true 
       };
+      
+      if (indices.start !== -1 && sfValues[i][indices.start]) {
+        const startDate = parseSafeDate(sfValues[i][indices.start]);
+        if (startDate) { 
+          const month = startDate.getMonth() + 1; 
+          groups[groupKey].isKamiki = (month >= 4 && month <= 9); 
+        }
+      }
     }
-
+    
     groups[groupKey].rowIndexes.push(i + 1);
 
-    if (indices.product !== -1 && indices.supplier !== -1 && suppVal) {
-      if (/[BＢ]/.test(prodVal)) {
-        if (!groups[groupKey].supplierB.includes(suppVal)) groups[groupKey].supplierB.push(suppVal);
-      } else {
-        if (!groups[groupKey].supplierA.includes(suppVal)) groups[groupKey].supplierA.push(suppVal);
+    const prodVal = indices.product !== -1 ? formatCompareValue(sfValues[i][indices.product]) : "";
+    const suppVal = indices.supplier !== -1 ? formatCompareValue(sfValues[i][indices.supplier]) : "";
+
+    if (suppVal) {
+      if (/[BＢ]/.test(prodVal)) { 
+        if (!groups[groupKey].supplierB.includes(suppVal)) groups[groupKey].supplierB.push(suppVal); 
+      } else { 
+        if (!groups[groupKey].supplierA.includes(suppVal)) groups[groupKey].supplierA.push(suppVal); 
       }
     }
-
-    const currentLineKey = `${pCode}🏎️${oppName}🏎️${startVal}🏎️${endVal}🏎️${prodVal}🏎️${suppVal}`;
-    if (!logSet.has(currentLineKey)) {
-      groups[groupKey].isChanged = true;
-      hasAnyGroupChanged = true;
-    }
-  }
-  return { groups, hasAnyGroupChanged };
-}
-
-function buildFolderHierarchyData(env, groups) {
-  let allGeneratedData = [];
-  let groupsToProcess = []; 
-  let no = 1;
-
-  for (const key in groups) {
-    const group = groups[key];
-    if (!group.isChanged) continue;
-
-    let monthList = [];
-    if (group.rawStart && group.rawEnd) {
-      let sDate = parseSafeDate(group.rawStart);
-      let eDate = parseSafeDate(group.rawEnd);
-      if (sDate && eDate) {
-        let currentMonth = new Date(sDate.getTime()); currentMonth.setDate(1);
-        let endMonth = new Date(eDate.getTime()); endMonth.setDate(1);
-        while (currentMonth <= endMonth) {
-          monthList.push(Utilities.formatDate(currentMonth, Session.getScriptTimeZone(), "yyyyMM"));
-          currentMonth.setMonth(currentMonth.getMonth() + 1);
-        }
-      }
-    }
-
-    const layer1 = `PJC：${group.projectCode}（商談名：${group.oppName}）`;
     
-    // 既存URLからの直接リネーム処理
-    if (group.folderUrl) {
-      const urlMatch = group.folderUrl.match(/[-\w]{25,}/);
-      if (urlMatch) {
-        try {
-          let existingFolder = DriveApp.getFolderById(urlMatch[0]);
-          if (existingFolder.getName() !== layer1) existingFolder.setName(layer1);
-        } catch (e) {
-          console.warn("URLからフォルダの特定に失敗: " + e.toString());
-          group.folderUrl = ""; 
-        }
-      }
+    // ステータス判定（一方通行ロジック）
+    let needsProcess = false;
+    if (existingStatus === "完了" || existingStatus === "対象外" || existingStatus.includes("エラー")) {
+      needsProcess = false; // 処理済みはスキップ
+    } else {
+      needsProcess = true;  // 空白・未処理データのみ対象
     }
 
-    const result = buildLayerDataFromMaster(env.masterData, no, layer1, monthList, group.supplierA, group.supplierB, true);
-    const dynamicInjectedData = result.data.map(row => {
-      let newRow = [...row];
-      newRow.splice(1, 0, group.buName, group.deptName); 
-      newRow._groupRef = group;
-      return newRow;
-    });
-
-    allGeneratedData.push(...dynamicInjectedData);
-    no = result.nextNo;
-    groupsToProcess.push(group);
+    if (needsProcess) {
+      groups[groupKey].isChanged = true;
+    }
   }
-  return { allGeneratedData, groupsToProcess };
+  
+  return { groups, duplicateErrors };
 }
 
+/**
+ * 構築した中間データをWorkspaceシートに書き出す
+ */
 function writeWorkspaceData(mainSheet, allGeneratedData) {
+  mainSheet.getRange(CONFIG.START_ROW, 1, mainSheet.getLastRow() || 1, mainSheet.getLastColumn() || 1).clearContent();
   const maxCol = Math.max(...allGeneratedData.map(row => row.filter(cell => typeof cell !== 'object').length));
   const formattedData = allGeneratedData.map(row => {
     let newRow = row.filter(cell => typeof cell !== 'object');
@@ -691,171 +1129,58 @@ function writeWorkspaceData(mainSheet, allGeneratedData) {
     return newRow;
   });
   mainSheet.getRange(CONFIG.START_ROW, 1, formattedData.length, maxCol).setValues(formattedData);
-  SpreadsheetApp.flush(); 
 }
 
-function executeFolderCreation(env, allGeneratedData, groupsToProcess, startTime) {
-  let createdCount = 0;
-  const folderCache = {}; 
-  let layer1Urls = [];
-  let newlyCreatedLayer1Folders = [];
-  let seenLayer1InThisRun = new Set();
-  const layer1UrlMapByName = {};
-  
-  const completedGroups = new Set();
-  let isTimeout = false;
-
-  for (let i = 0; i < allGeneratedData.length; i++) {
-    const currentGroup = allGeneratedData[i]._groupRef;
-    
-    if (Date.now() - startTime > CONFIG.TIME_LIMIT_MS) {
-      console.warn("実行時間制限到達のため中断します。動的トリガーで再開します。");
-      isTimeout = true;
-      break; 
-    }
-
-    const row = allGeneratedData[i].slice(1).filter(cell => typeof cell !== 'object');
-    
-    let folder = currentGroup.isKamiki ? env.folder_root_kamiki : env.folder_root_shimoki;
-    let currentPath = currentGroup.isKamiki ? env.folder_id_root_kamiki : env.folder_id_root_shimoki;
-    let currentLayer1Url = ""; 
-    let isNewLayer1 = false;
-
-    for (let j = 0; j < row.length; j++) {
-      if (row[j] === "") continue;
-      let folder_name = String(row[j]).trim();
-      if (!folder_name) continue;
-
-      currentPath += "/" + folder_name;
-
-      if (j === 2 && currentGroup.folderUrl) {
-        const match = currentGroup.folderUrl.match(/[-\w]{25,}/);
-        if (match) {
-          try {
-            folder = DriveApp.getFolderById(match[0]); 
-            folderCache[currentPath] = folder;
-            currentLayer1Url = folder.getUrl();
-            layer1UrlMapByName[folder_name] = currentLayer1Url;
-            continue; 
-          } catch (e) {}
-        }
-      }
-
-      if (folderCache[currentPath]) {
-        folder = folderCache[currentPath];
-      } else {
-        let folders = folder.getFoldersByName(folder_name);
-        if (folders.hasNext()) {
-          folder = folders.next();
-        } else {
-          folder = folder.createFolder(folder_name);
-          createdCount++;
-          if (j === 2) isNewLayer1 = true; 
-        }
-        folderCache[currentPath] = folder;
-      }
-      
-      if (j === 2) {
-        currentLayer1Url = folder.getUrl();
-        layer1UrlMapByName[folder_name] = currentLayer1Url; 
-        if (isNewLayer1 && !seenLayer1InThisRun.has(folder_name)) {
-          newlyCreatedLayer1Folders.push({ name: folder_name, url: currentLayer1Url });
-          seenLayer1InThisRun.add(folder_name);
-        }
-      }
-    }
-    
-    completedGroups.add(currentGroup);
-  }
-
-  return { 
-    createdCount, 
-    layer1UrlMapByName, 
-    newlyCreatedLayer1Folders, 
-    isTimeout,
-    completedGroups: Array.from(completedGroups)
-  };
-}
-
-function syncUrlsAndStatuses(env, groups, layer1UrlMapByName = {}) {
-  const urlRange = env.sfSheet.getRange(1, env.indices.url + 1, env.sfData.length, 1);
-  const urlValues = urlRange.getValues();
-  const statusRange = env.sfSheet.getRange(1, env.indices.status + 1, env.sfData.length, 1);
-  const statusValues = statusRange.getValues();
-
-  for (let r = 1; r < env.sfData.length; r++) {
-    urlValues[r][0] = "";
-    statusValues[r][0] = "";
-  }
-
-  for (const key in groups) {
-    const group = groups[key];
-    const latestLayer1Name = `PJC：${group.projectCode}（商談名：${group.oppName}）`;
-    
-    const latestUrl = layer1UrlMapByName[latestLayer1Name] || group.folderUrl;
-    
-    if (latestUrl) {
-      group.rowIndexes.forEach(rowIdx => {
-        urlValues[rowIdx - 1][0] = latestUrl;
-        statusValues[rowIdx - 1][0] = "完了";
-      });
-    }
-  }
-
-  urlRange.setValues(urlValues);
-  statusRange.setValues(statusValues);
-  SpreadsheetApp.flush();
-}
-
-function finalizeWithoutChanges(env, ui) {
-  env.logSheet.clear();
-  const finalSfDataNoChange = env.sfSheet.getDataRange().getValues();
-  env.logSheet.getRange(1, 1, finalSfDataNoChange.length, finalSfDataNoChange[0].length).setValues(finalSfDataNoChange);
-  
-  if (ui) ui.alert("処理完了（不要データのクリア、または変更箇所なしのためスキップ）");
-  else console.log("変更なし・クリーンアップスキップ");
-}
-
-function finalizeWithNoMasterMatch(env, ui) {
-  env.logSheet.clear();
-  const finalData = env.sfSheet.getDataRange().getValues();
-  env.logSheet.getRange(1, 1, finalData.length, finalData[0].length).setValues(finalData);
-  
-  if (ui) ui.alert("データ変更はありましたが、マスタ合致がないためスキップしました。");
-  else console.log("マスタ合致なしスキップ");
-}
-
-function handleTimeoutEnd(env, completedGroups, createdCount, ui) {
-  if (completedGroups.length > 0) {
-    const freshSfData = env.sfSheet.getDataRange().getValues();
-    const appendData = [];
-    completedGroups.forEach(group => {
-      group.rowIndexes.forEach(rowIdx => {
-        appendData.push(freshSfData[rowIdx - 1]);
-      });
-    });
-    
-    const startRow = env.logSheet.getLastRow() + 1;
-    if (startRow === 1) {
-      appendData.unshift(env.headers);
-    }
-    env.logSheet.getRange(startRow, 1, appendData.length, appendData[0].length).setValues(appendData);
-    SpreadsheetApp.flush();
-  }
-
-  setNextTrigger();
-
-  const msg = `⚠️ 処理時間が上限に達したため中断しました。\n今回新たに ${createdCount} 個のフォルダを作成しました。\n残りの未処理分は自動的に1分後に再開されます。`;
-  if (ui) ui.alert(msg);
-  else console.log(msg);
-}
-
-function finalizeSuccess(env, createdCount, ui) {
-  env.logSheet.clear();
+/**
+ * すべてのデータ行が正常に完了した場合の終了処理
+ */
+function finalizeSuccess(env, createdCount, totalRows, ui, duplicateErrors = [], isAlreadyDone = false) {
   const finalData = env.sfSheet.getDataRange().getValues(); 
-  env.logSheet.getRange(1, 1, finalData.length, finalData[0].length).setValues(finalData);
-
-  const msg = `処理完了：新たに ${createdCount} 個のフォルダを差分作成しました。\nすべての案件の処理が完了しました。`;
-  if (ui) ui.alert(msg);
+  saveLogSheetSafely_(env.logSheet, finalData);
+  
+  let msg = "";
+  if (isAlreadyDone) {
+    msg = `🎉 全データチェック完了（計 ${totalRows} 行）\n新しい差分や未処理の案件はありませんでした。`;
+  } else {
+    msg = `🎉 全データ処理完了（計 ${totalRows} 行）\n新たに ${createdCount} 個のフォルダを差分作成・ステータス更新しました。`;
+  }
+  
+  if (ui) ui.alert(msg); 
   else console.log(msg);
+}
+
+/**
+ * ログシートへの超堅牢一括保存
+ * @param {GoogleAppsScript.Spreadsheet.Sheet} logSheet 保存対象のログシート
+ * @param {Array<Array<any>>} data 書き込む2次元配列データ
+ */
+function saveLogSheetSafely_(logSheet, data) {
+  try {
+    if (!logSheet || !data || !Array.isArray(data) || data.length === 0 || !data[0] || !Array.isArray(data[0]) || data[0].length === 0) {
+      console.warn("saveLogSheetSafely_: 書き込み対象データが存在しないか不正な構造のためスキップしました。");
+      return;
+    }
+
+    const numRows = data.length;
+    const numCols = data[0].length;
+    const lastRow = logSheet.getLastRow();
+    const lastCol = logSheet.getLastColumn();
+
+    logSheet.getRange(1, 1, numRows, numCols).setValues(data);
+
+    if (lastRow > numRows) {
+      const clearRows = lastRow - numRows;
+      const clearCols = Math.max(lastCol || 1, numCols);
+
+      if (clearRows > 0 && clearCols > 0) {
+        const targetRange = logSheet.getRange(numRows + 1, 1, clearRows, clearCols);
+        if (targetRange && typeof targetRange.clearContents === 'function') {
+          targetRange.clearContents();
+        }
+      }
+    }
+    SpreadsheetApp.flush();
+  } catch (err) {
+    console.error("saveLogSheetSafely_ 実行時に例外が発生しましたが、基本保存は完了しています: " + err.message);
+  }
 }
