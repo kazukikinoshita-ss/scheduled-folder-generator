@@ -1,0 +1,474 @@
+/**
+ * @fileoverview 誤作成フォルダ検知（監査）ツール v1.5.2
+ * 
+ * 【主な機能】
+ * 1. 案件（商談ID）単位での集約・ユニーク監査（1案件1行出力）
+ * 2. 異なる商談ID間で同一URLが使い回されている「統合エラー」の検知
+ * 3. ログ記録名とDrive実体名が異なる「結合エラー（書き換え）」の検知
+ * 4. 階層構造を照合する「配置エラー」および「警告（表記ゆれ）」の検知（正規化対応）
+ * 5. raw_SFとlog_SFの「不整合エラー」の検知（幽霊URLバグ修正済）
+ * 6. ★v1.5.2追加: SFマスタとLogのURLが一致する場合は階層チェックをスキップ（高速化＆ノイズ削減）
+ * 7. ゴミ箱・権限エラーによる途中停止の完全防止（安全スキップ）
+ * 8. Drive APIキャッシュ構造による高速化および自動レジューム（4.5分制限）
+ */
+
+// =========================================================
+// 設定・定数（マジックナンバー・シート名を一元管理）
+// =========================================================
+const AUDIT_CONFIG = {
+  SHEET_RAW_FOLDER: "raw_folder",
+  SHEET_SF: "raw_SF",
+  SHEET_LOG: "log_SF",
+  SHEET_REPORT: "Audit_Report",
+  TIME_LIMIT_MS: 4.5 * 60 * 1000, 
+  PROPERTY_KEY_INDEX: "AUDIT_CURRENT_OPP_INDEX" 
+};
+
+// =========================================================
+// ヘルパー関数群
+// =========================================================
+
+/**
+ * 文字列を正規化し、比較用にスペース除去と小文字統一を行う
+ * @param {string} str 
+ * @returns {string}
+ */
+function normalizeForCompare(str) {
+  if (!str) return "";
+  return String(str).replace(/[\s ]/g, "").toLowerCase();
+}
+
+/**
+ * 差分可視化関数: 見えない空白を可視化タグに変換する
+ * @param {string} str 
+ * @returns {string}
+ */
+function visualizeStringDiff(str) {
+  if (str === null || str === undefined) return "null";
+  return String(str).replace(/ /g, "[半角空白]").replace(/ /g, "[全角空白]");
+}
+
+/**
+ * 日付文字列や数値をパースし、Dateオブジェクトに変換する
+ * @param {any} val 
+ * @returns {Date|null}
+ */
+function parseSafeDateForAudit(val) {
+  if (val instanceof Date) {
+    return isNaN(val.getTime()) ? null : val;
+  }
+  if (!val) return null;
+  
+  let str = String(val).trim();
+  if (!str) return null;
+
+  if (!isNaN(str)) {
+    let num = parseFloat(str);
+    if (num > 30000 && num < 60000) { 
+      return new Date((num - 25569) * 86400 * 1000);
+    }
+  }
+
+  str = str.replace(/-/g, "/");
+  let d = new Date(str);
+  if (!isNaN(d.getTime())) return d;
+
+  if (/^\d{6}$/.test(str)) {
+    let y = parseInt(str.substring(0, 4), 10);
+    let m = parseInt(str.substring(4, 6), 10) - 1;
+    return new Date(y, m, 1);
+  }
+  return null;
+}
+
+/**
+ * フォルダURLからフォルダIDを抽出する
+ * @param {string} url 
+ * @returns {string|null}
+ */
+function extractFolderIdForAudit(url) {
+  if (!url) return null;
+  const match = String(url).match(/[-\w]{25,}/);
+  return match ? match[0] : null;
+}
+
+/**
+ * Drive上のフォルダ実体情報を取得する（キャッシュ機能・ゴミ箱判定付き）
+ * @param {string} folderId 
+ * @param {Object} cache 
+ * @returns {{exists: boolean, name: string, parentId: string|null, isTrashed: boolean}}
+ */
+function getCachedFolderInfo(folderId, cache) {
+  if (!folderId) return { exists: false, name: "-", parentId: null, isTrashed: false };
+  if (cache[folderId]) return cache[folderId];
+
+  try {
+    const folder = DriveApp.getFolderById(folderId);
+    
+    if (folder.isTrashed()) {
+      const info = { exists: false, name: "【ゴミ箱内】", parentId: null, isTrashed: true };
+      cache[folderId] = info;
+      return info;
+    }
+
+    const parents = folder.getParents();
+    const parentId = parents.hasNext() ? parents.next().getId() : null;
+    const info = {
+      exists: true,
+      name: folder.getName(),
+      parentId: parentId,
+      isTrashed: false
+    };
+    cache[folderId] = info;
+    return info;
+  } catch (e) {
+    const info = {
+      exists: false,
+      name: "取得不可(権限なし/削除)",
+      parentId: null,
+      isTrashed: false
+    };
+    cache[folderId] = info;
+    return info;
+  }
+}
+
+// =========================================================
+// トリガー・状態管理
+// =========================================================
+
+function clearAuditTriggers() {
+  const triggers = ScriptApp.getProjectTriggers();
+  for (let i = 0; i < triggers.length; i++) {
+    if (triggers[i].getHandlerFunction() === "continueAudit") {
+      ScriptApp.deleteTrigger(triggers[i]);
+    }
+  }
+}
+
+function setAuditNextTrigger() {
+  ScriptApp.newTrigger("continueAudit")
+    .timeBased()
+    .after(60 * 1000)
+    .create();
+}
+
+function updateAuditStatus(sheet, statusMsg) {
+  if (!sheet) return;
+  sheet.getRange("A1").setValue(statusMsg).setFontColor("red").setFontWeight("bold");
+  SpreadsheetApp.flush();
+}
+
+// =========================================================
+// メイン処理（初回実行・レジューム共通）
+// =========================================================
+
+function startFolderAudit() {
+  const ui = SpreadsheetApp.getUi();
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  
+  PropertiesService.getScriptProperties().deleteProperty(AUDIT_CONFIG.PROPERTY_KEY_INDEX);
+  clearAuditTriggers();
+  
+  let reportSheet = ss.getSheetByName(AUDIT_CONFIG.SHEET_REPORT);
+  if (!reportSheet) {
+    reportSheet = ss.insertSheet(AUDIT_CONFIG.SHEET_REPORT);
+  } else {
+    reportSheet.clear();
+  }
+  
+  const headers = [
+    "商談ID", "log_SF上の商談名", "SFマスタURL(K列/末尾列)", "対象URL(Log/M列)", "Drive上の実際のフォルダ名", "期待される親ルート", "判定結果", "詳細理由"
+  ];
+  reportSheet.getRange(2, 1, 1, headers.length).setValues([headers]).setFontColor("white").setBackground("#434343").setFontWeight("bold");
+  reportSheet.setFrozenRows(2);
+  
+  updateAuditStatus(reportSheet, "【実行中】データ集約および監査を開始しています...");
+  
+  ui.alert("案件単位での詳細監査を開始します。\n進捗状況は「Audit_Report」シートのA1セルをご確認ください。");
+  
+  executeAuditLogic();
+}
+
+function continueAudit() {
+  clearAuditTriggers();
+  executeAuditLogic();
+}
+
+/**
+ * 監査コアロジック
+ */
+function executeAuditLogic() {
+  const startTime = Date.now();
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  const reportSheet = ss.getSheetByName(AUDIT_CONFIG.SHEET_REPORT);
+  const logSheet = ss.getSheetByName(AUDIT_CONFIG.SHEET_LOG);
+  const sfSheet = ss.getSheetByName(AUDIT_CONFIG.SHEET_SF);
+  const rawFolderSheet = ss.getSheetByName(AUDIT_CONFIG.SHEET_RAW_FOLDER);
+  const props = PropertiesService.getScriptProperties();
+  
+  if (!logSheet || !sfSheet || !rawFolderSheet || !reportSheet) {
+    console.error("必須シートが見つかりません。");
+    return;
+  }
+
+  const urlKamiki = rawFolderSheet.getRange("B1").getValue().toString().trim();
+  const urlShimoki = rawFolderSheet.getRange("B3").getValue().toString().trim();
+  const idKamiki = extractFolderIdForAudit(urlKamiki);
+  const idShimoki = extractFolderIdForAudit(urlShimoki);
+  
+  if (!idKamiki || !idShimoki) {
+    updateAuditStatus(reportSheet, "【エラー終了】raw_folder シートの上期・下期ルートURLの設定が不正です。");
+    return;
+  }
+
+  // ---------------------------------------------------------
+  // 事前データ整理①: raw_SF のマッピング構築
+  // ---------------------------------------------------------
+  const sfData = sfSheet.getDataRange().getValues();
+  const sfHeaders = sfData[0];
+  const cleanHeader = (h) => String(h).replace(/\s/g, "");
+  
+  let urlIdx = sfHeaders.findIndex(h => cleanHeader(h).includes("格納先フォルダURL"));
+  if (urlIdx === -1) {
+    urlIdx = sfHeaders.findIndex(h => cleanHeader(h).includes("ファイルストレージ(URL)"));
+  }
+
+  const sfIdx = {
+    oppId: sfHeaders.findIndex(h => cleanHeader(h).includes("商談ID") || cleanHeader(h).toLowerCase().includes("opportunityid")),
+    url: urlIdx
+  };
+
+  const sfUrlMap = {}; 
+  if (sfIdx.oppId !== -1 && sfIdx.url !== -1) {
+    for (let i = 1; i < sfData.length; i++) {
+      const oppId = String(sfData[i][sfIdx.oppId]).trim();
+      const url = String(sfData[i][sfIdx.url]).trim();
+      if (oppId) sfUrlMap[oppId] = url;
+    }
+  }
+
+  // ---------------------------------------------------------
+  // 事前データ整理②: log_SF の集約 & URL共有マップ構築
+  // ---------------------------------------------------------
+  const logData = logSheet.getDataRange().getValues();
+  if (logData.length <= 1) {
+    updateAuditStatus(reportSheet, "【完了】log_SF に対象データが存在しません。");
+    return;
+  }
+
+  const logHeaders = logData[0];
+  const idx = {
+    oppId: logHeaders.findIndex(h => cleanHeader(h).includes("商談ID")),
+    oppName: logHeaders.findIndex(h => cleanHeader(h).includes("商談名")),
+    start: logHeaders.findIndex(h => cleanHeader(h).includes("売上開始月")),
+    url: logHeaders.findIndex(h => cleanHeader(h).includes("格納先フォルダURL")),
+    buName: logHeaders.findIndex(h => cleanHeader(h).includes("BusinessUnitName") || cleanHeader(h).includes("BU")),
+    groupName: logHeaders.findIndex(h => cleanHeader(h).includes("計上部署") || cleanHeader(h).includes("グループ"))
+  };
+
+  const oppMap = {};       
+  const urlToOppSet = {};  
+
+  for (let i = 1; i < logData.length; i++) {
+    const oppId = String(logData[i][idx.oppId]).trim();
+    if (!oppId) continue;
+
+    const url = idx.url !== -1 ? String(logData[i][idx.url]).trim() : "";
+    const name = idx.oppName !== -1 ? String(logData[i][idx.oppName]).trim() : "不明";
+    const startVal = idx.start !== -1 ? logData[i][idx.start] : "";
+    
+    const rawBuName = idx.buName !== -1 ? String(logData[i][idx.buName]) : "";
+    const rawGroupName = idx.groupName !== -1 ? String(logData[i][idx.groupName]) : "";
+
+    if (!oppMap[oppId]) {
+      oppMap[oppId] = {
+        oppId: oppId, name: name, startVal: startVal, url: url,
+        rawBuName: rawBuName, rawGroupName: rawGroupName, logOccurrences: 1
+      };
+    } else {
+      oppMap[oppId].logOccurrences += 1;
+      if (!oppMap[oppId].url && url) oppMap[oppId].url = url;
+      if (!oppMap[oppId].rawBuName && rawBuName) oppMap[oppId].rawBuName = rawBuName;
+      if (!oppMap[oppId].rawGroupName && rawGroupName) oppMap[oppId].rawGroupName = rawGroupName;
+    }
+
+    if (url) {
+      if (!urlToOppSet[url]) urlToOppSet[url] = new Set();
+      urlToOppSet[url].add(oppId);
+    }
+  }
+
+  const oppList = Object.values(oppMap);
+  const savedIndex = props.getProperty(AUDIT_CONFIG.PROPERTY_KEY_INDEX);
+  const startIndex = savedIndex ? parseInt(savedIndex, 10) : 0;
+  const folderCache = {};
+
+  // ---------------------------------------------------------
+  // 本監査ループ（商談ID単位）
+  // ---------------------------------------------------------
+  let reportData = [];
+  let isTimeout = false;
+  let currentIndex = startIndex;
+
+  for (let i = startIndex; i < oppList.length; i++) {
+    currentIndex = i;
+    if (Date.now() - startTime > AUDIT_CONFIG.TIME_LIMIT_MS) {
+      isTimeout = true; break;
+    }
+
+    const item = oppList[i];
+    const oppId = item.oppId;
+    const oppName = item.name;
+    const startVal = item.startVal;
+    const targetUrl = item.url;
+    
+    const sfUrl = sfUrlMap[oppId] || "";
+    const sfFolderId = extractFolderIdForAudit(sfUrl);
+    const logFolderId = extractFolderIdForAudit(targetUrl);
+
+    // 0. SF(生成URL)とLogの不整合チェック
+    let isDataInconsistent = false;
+    let inconsistencyReason = "";
+    if (sfFolderId && logFolderId && sfFolderId !== logFolderId) {
+      isDataInconsistent = true;
+      inconsistencyReason = "SFマスタとLogで別々のフォルダIDが紐づいています";
+    } else if (sfFolderId && !logFolderId) {
+      isDataInconsistent = true;
+      inconsistencyReason = "SFマスタにはURLが存在しますが、Logには存在しません";
+    } else if (!sfFolderId && logFolderId) {
+      isDataInconsistent = true;
+      inconsistencyReason = "SFマスタは空欄ですが、Logに幽霊URLが存在しています";
+    }
+
+    if (!targetUrl && !isDataInconsistent) {
+      reportData.push([oppId, oppName, sfUrl, "未設定", "-", "-", "⚠️ URL未記録", "フォルダ未作成です"]);
+      continue;
+    }
+
+    // 1. 他案件とのURL重複（不当な統合）チェック
+    const sharingOppCount = urlToOppSet[targetUrl] ? urlToOppSet[targetUrl].size : 1;
+    const isSharedWithOtherOpps = sharingOppCount > 1;
+
+    let expectedParentId = idShimoki;
+    let expectedParentName = "下期ルート";
+    if (startVal) {
+      const startDate = parseSafeDateForAudit(startVal);
+      if (startDate && startDate.getMonth() + 1 >= 4 && startDate.getMonth() + 1 <= 9) {
+        expectedParentId = idKamiki; expectedParentName = "上期ルート";
+      }
+    }
+
+    // ★v1.5.2: SFマスタ絶対主義（URL一致時はL2/L3の取得をバイパス）
+    const isMatchedWithSF = (sfFolderId && logFolderId && sfFolderId === logFolderId);
+
+    // 2. Drive階層情報の取得（L1は実在確認のため必須）
+    const l1 = getCachedFolderInfo(logFolderId, folderCache); 
+
+    if (!l1.exists) {
+      let resultStr = "❌ アクセス不可";
+      let reasonStr = l1.isTrashed ? "対象フォルダがゴミ箱に移動されています" : "フォルダが存在しないかアクセス権限がありません";
+      if (isDataInconsistent) {
+        resultStr = "🚨 複合エラー";
+        reasonStr = `${inconsistencyReason} ＋ ${reasonStr}`;
+      }
+      reportData.push([oppId, oppName, sfUrl, targetUrl, l1.name, expectedParentName, resultStr, reasonStr]);
+      continue;
+    }
+
+    // 3. 各種不一致判定
+    let result = "正常";
+    let reasons = [];
+
+    if (isDataInconsistent) {
+      result = "🚨 不整合エラー";
+      reasons.push(inconsistencyReason);
+    }
+
+    if (isSharedWithOtherOpps) {
+      if (result === "正常") result = "🚨 統合エラー";
+      reasons.push(`同一URLが計 ${sharingOppCount} 件の別案件で共有・上書きされています`);
+    }
+
+    const normOppName = normalizeForCompare(oppName);
+    const normL1Name = normalizeForCompare(l1.name);
+    if (!normL1Name.includes(normOppName) && !normOppName.includes(normL1Name)) {
+      if (result === "正常") result = "🚨 結合エラー";
+      reasons.push(`フォルダ名不一致 (ログ: "${oppName}" / Drive実体: "${l1.name}")`);
+    }
+
+    // 階層チェックロジック（SF一致時は完全スキップ）
+    if (!isMatchedWithSF) {
+      const l2 = l1.parentId ? getCachedFolderInfo(l1.parentId, folderCache) : null; 
+      const l3 = (l2 && l2.parentId) ? getCachedFolderInfo(l2.parentId, folderCache) : null; 
+      const actualRootId = l3 ? l3.parentId : null; 
+
+      let hierarchyErrors = [];
+      let hierarchyWarnings = [];
+
+      if (item.rawGroupName) {
+        if (!l2 || !l2.exists) {
+          hierarchyErrors.push(`グループ取得失敗 (想定: "${item.rawGroupName.trim()}")`);
+        } else {
+          const normLogGroup = normalizeForCompare(item.rawGroupName);
+          const normDriveGroup = normalizeForCompare(l2.name);
+          if (normLogGroup !== normDriveGroup) {
+            hierarchyWarnings.push(`グループ名相違 (ログ: "${item.rawGroupName}" / Drive: "${l2.name}")`);
+          }
+        }
+      }
+
+      if (item.rawBuName) {
+        if (!l3 || !l3.exists) {
+          hierarchyErrors.push(`BU取得失敗 (想定: "${item.rawBuName.trim()}")`);
+        } else {
+          const normLogBu = normalizeForCompare(item.rawBuName);
+          const normDriveBu = normalizeForCompare(l3.name);
+          if (normLogBu !== normDriveBu) {
+            hierarchyWarnings.push(`BU名相違 (ログ: "${item.rawBuName}" / Drive: "${l3.name}")`);
+          }
+        }
+      }
+
+      if (actualRootId !== expectedParentId) {
+        hierarchyErrors.push(`ルート階層不一致 (想定: ${expectedParentName})`);
+      }
+
+      if (hierarchyErrors.length > 0) {
+        if (result === "正常") result = "🚨 配置エラー";
+        reasons.push(hierarchyErrors.join("、"));
+      } else if (hierarchyWarnings.length > 0) {
+        if (result === "正常") result = "⚠️ 警告(表記ゆれ)";
+        reasons.push(hierarchyWarnings.join("、"));
+      }
+    }
+
+    if (item.logOccurrences > 1) {
+      reasons.push(`(注: log_SF内に同商談IDが ${item.logOccurrences} 行記録されています)`);
+    }
+
+    // 異常検知時のみ出力
+    if (result !== "正常") {
+      reportData.push([
+        oppId, oppName, sfUrl, targetUrl, l1.name, expectedParentName, result, reasons.join(" | ")
+      ]);
+    }
+  }
+
+  // 結果の書き込み
+  if (reportData.length > 0) {
+    const lastRow = reportSheet.getLastRow();
+    reportSheet.getRange(lastRow + 1, 1, reportData.length, reportData[0].length).setValues(reportData);
+  }
+
+  // 次回再開制御
+  if (isTimeout) {
+    props.setProperty(AUDIT_CONFIG.PROPERTY_KEY_INDEX, currentIndex.toString());
+    setAuditNextTrigger();
+    const progress = Math.floor((currentIndex / oppList.length) * 100);
+    updateAuditStatus(reportSheet, `【一時停止中】進行度 約${progress}% (${currentIndex}/${oppList.length}案件完了)。1分後に自動再開します...`);
+  } else {
+    props.deleteProperty(AUDIT_CONFIG.PROPERTY_KEY_INDEX);
+    updateAuditStatus(reportSheet, `【✅ 監査完了】全 ${oppList.length} 案件の検査が終了しました。検出された異常は上記一覧をご確認ください。`);
+  }
+}
