@@ -507,7 +507,6 @@ function manual_make_folder() {
 // =========================================================
 /**
  * タイムアウト時に起動される再開用関数
- * ★v2.0.8 改修: 再開であることを伝えるフラグ(true)を渡す
  */
 function continue_auto_make() {
   auto_make_folder_from_sf(true);
@@ -536,7 +535,7 @@ function setNextTrigger() {
 }
 
 // =========================================================
-// 【自動モード】メイン関数 (★v2.0.8 セッション単位追記・完全版)
+// 【自動モード】メイン関数 (★v2.0.9 エラー時URL記録・スパム完全防止版)
 // =========================================================
 /**
  * SFデータから自動的にフォルダを生成するメイン処理
@@ -560,7 +559,6 @@ function auto_make_folder_from_sf(isContinuation = false) {
     const env = initializeAutoEnvironment(ui, startTime);
     if (!env) return; 
 
-    // ★v2.0.8 改修: 初回実行時（セッション開始時）のみWorkspaceシートをクリアする
     if (!isContinuation) {
       const lastRow = env.mainSheet.getLastRow();
       const lastCol = env.mainSheet.getLastColumn();
@@ -586,7 +584,7 @@ function auto_make_folder_from_sf(isContinuation = false) {
     const changedKeys = Object.keys(groups).filter(k => groups[k].isChanged);
     const totalTargets = changedKeys.length;
 
-    // 処理すべき対象がゼロなら即終了 (ただし修復やエラーステータス更新があれば保存)
+    // 処理すべき対象がゼロなら即終了
     if (totalTargets === 0) {
       if (env.hasUpdates) {
         env.sfSheet.getRange(1, 1, env.sfValues.length, env.sfValues[0].length).setValues(env.sfValues);
@@ -653,6 +651,8 @@ function auto_make_folder_from_sf(isContinuation = false) {
           group.rowIndexes.forEach(rowIdx => {
             const r = rowIdx - 1;
             env.sfValues[r][env.indices.status] = checkRes.status;
+            // ★ v2.0.9 修正: 階層不一致エラーの際も、エラー対象となったURLをログに必ず記録する
+            env.sfValues[r][env.indices.url] = group.folderUrl; 
             env.hasUpdates = true;
           });
           processedCount++;
@@ -687,6 +687,8 @@ function auto_make_folder_from_sf(isContinuation = false) {
         group.rowIndexes.forEach(rowIdx => {
           const r = rowIdx - 1;
           env.sfValues[r][env.indices.status] = "エラー(作成失敗)";
+          // ★ v2.0.9 修正: 作成失敗時もURLを記録する
+          env.sfValues[r][env.indices.url] = group.folderUrl; 
           env.hasUpdates = true;
         });
         processedCount++;
@@ -696,7 +698,7 @@ function auto_make_folder_from_sf(isContinuation = false) {
       Utilities.sleep(CONFIG.API_SLEEP_MS);
     }
 
-    // 5. 処理結果の書き出し（★v2.0.8 常にAppend処理）
+    // 5. 処理結果の書き出し
     if (allGeneratedDataForWorkspace.length > 0) {
       writeWorkspaceData(env.mainSheet, allGeneratedDataForWorkspace);
     }
@@ -1108,7 +1110,7 @@ function buildLogDataMaps(logData) {
     if (idx.oppId !== -1 && idx.url !== -1) {
       const oppIdStr = String(logData[i][idx.oppId]).trim(); 
       const urlStr = String(logData[i][idx.url]).trim();
-      if (oppIdStr && urlStr) logUrlMap[oppIdStr] = urlStr;
+      if (oppIdStr && urlStr) logUrlMap[oppIdStr] = logUrlMap[oppIdStr] = urlStr;
     }
   }
   return { logSet, logUrlMap };
@@ -1190,6 +1192,8 @@ function parseSfDataAndDetectChangesAll(env, logSet, logUrlMap) {
           continue;
       } else {
           sfValues[i][indices.status] = "エラー(URL重複)";
+          // ★ v2.0.9 修正: 重複エラーの際も、エラー対象となったURLをログに必ず記録する
+          sfValues[i][indices.url] = determinedUrl; 
           env.hasUpdates = true;
           newDuplicateUrls.add(determinedUrl); 
           continue; 
@@ -1254,14 +1258,10 @@ function parseSfDataAndDetectChangesAll(env, logSet, logUrlMap) {
   return { groups, duplicateErrors };
 }
 
-/**
- * ★v2.0.8 改修: 常に最下行を取得して追記（Append）する仕様に変更
- */
 function writeWorkspaceData(mainSheet, allGeneratedData) {
   if (!allGeneratedData || allGeneratedData.length === 0) return;
 
   const lastRow = mainSheet.getLastRow();
-  // シートが空（ヘッダのみ等）の場合でも安全に CONFIG.START_ROW 以降へ書き込む
   const startRow = Math.max(CONFIG.START_ROW, lastRow + 1);
 
   const maxCol = Math.max(...allGeneratedData.map(row => row.filter(cell => typeof cell !== 'object').length));
