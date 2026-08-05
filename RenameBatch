@@ -1,0 +1,222 @@
+/**
+ * =========================================================
+ * 【使い捨てバッチ】特定親フォルダ配下対象 フォルダ名一括修正スクリプト
+ * （完全自動レジューム ＆ 再帰的階層検索 ＆ 正規表現による表記ゆれ対応版）
+ * =========================================================
+ * 概要: raw_SFシートの指定列（layer1）を起点とし、配下の全階層を再帰的に検索。
+ * 表記ゆれを含む旧名フォルダを新名に安全に一括リネームします。
+ * 5分経過時に自動でトリガーを生成し、ブラウザを閉じても全件完了するまで自動継続します。
+ * =========================================================
+ */
+
+/**
+ * リネーム処理用の設定オブジェクト
+ */
+const BATCH_CONFIG = {
+  SHEET_SF: "raw_SF",
+  TARGET_URL_HEADER: "格納先フォルダURL",
+  
+  // 正規表現: 1つ以上の空白(半角/全角) + コロン(半角/全角) + "購買稟議なし" が末尾($)にあるものを検知
+  REGEX_TARGET: /[\s ]+[：:]購買稟議なし$/, 
+  NEW_SUFFIX: "：購買稟議なし",  
+  
+  TIME_LIMIT_MS: 5 * 60 * 1000,  // 5分 (GASの6分制限対策)
+  PROPERTY_KEY_LAST_ROW: "RENAME_BATCH_LAST_INDEX", // 進捗行数の記憶用キー
+  PROPERTY_KEY_STATS: "RENAME_BATCH_STATS",         // 累計処理件数の記憶用キー
+  MAIN_FUNCTION_NAME: "runFolderRenameFromSheetBatch" // トリガーに登録するメイン関数名
+};
+
+/**
+ * プロジェクト内に存在する自分自身の自動実行トリガーをすべて削除する安全装置
+ */
+function deleteTriggers_() {
+  const triggers = ScriptApp.getProjectTriggers();
+  for (let i = 0; i < triggers.length; i++) {
+    if (triggers[i].getHandlerFunction() === BATCH_CONFIG.MAIN_FUNCTION_NAME) {
+      ScriptApp.deleteTrigger(triggers[i]);
+    }
+  }
+}
+
+/**
+ * HTMLタグやURLエンコードされた文字列から純粋なGoogle Drive IDを正確に抽出する
+ * @param {any} rawInput - スプレッドシートから取得したURL文字列
+ * @returns {string|null} 抽出された純粋なGoogle Drive ID（抽出不能な場合はnull）
+ */
+function extractCleanDriveIdForBatch_(rawInput) {
+  if (!rawInput) return null;
+  let str = String(rawInput).trim();
+  if (!str) return null;
+
+  try { str = decodeURIComponent(str); } catch (e) {}
+
+  let mFolder = str.match(/folders\/([a-zA-Z0-9_-]{25,})/);
+  if (mFolder) return mFolder[1];
+
+  let mId = str.match(/[?&]id=([a-zA-Z0-9_-]{25,})/);
+  if (mId) return mId[1];
+
+  let mD = str.match(/\/d\/([a-zA-Z0-9_-]{25,})/);
+  if (mD) return mD[1];
+
+  let mGen = str.match(/([a-zA-Z0-9_-]{25,})/);
+  if (mGen) {
+    let matched = mGen[1];
+    if ((matched.startsWith("2F") || matched.startsWith("3D")) && matched.length > 30) {
+      matched = matched.substring(2);
+    }
+    return matched;
+  }
+  return null;
+}
+
+/**
+ * 再帰的に子フォルダを全探索し、条件に一致するフォルダをリネームする
+ * @param {GoogleAppsScript.Drive.Folder} folder - 検索対象の親フォルダ
+ * @param {Object} currentRunStats - 今回の実行枠での集計用オブジェクト
+ */
+function processFoldersRecursively_(folder, currentRunStats) {
+  if (folder.isTrashed()) return;
+
+  const childFolders = folder.getFolders();
+  
+  while (childFolders.hasNext()) {
+    const childFolder = childFolders.next();
+    if (childFolder.isTrashed()) continue;
+
+    const currentName = childFolder.getName();
+
+    if (BATCH_CONFIG.REGEX_TARGET.test(currentName)) {
+      const newName = currentName.replace(BATCH_CONFIG.REGEX_TARGET, BATCH_CONFIG.NEW_SUFFIX);
+      childFolder.setName(newName);
+      
+      console.log(`✅ リネーム成功: "${currentName}" -> "${newName}"`);
+      currentRunStats.processedCount++;
+      currentRunStats.foundInCurrentTree = true;
+    }
+
+    // さらに下の階層へ潜って再帰検索
+    processFoldersRecursively_(childFolder, currentRunStats);
+  }
+}
+
+/**
+ * 進捗記憶とトリガーを強制的にリセットするヘルパー関数
+ * （途中で処理を中止したい場合や、最初からやり直したい場合に単独で実行）
+ */
+function resetBatchProgress() {
+  const props = PropertiesService.getScriptProperties();
+  props.deleteProperty(BATCH_CONFIG.PROPERTY_KEY_LAST_ROW);
+  props.deleteProperty(BATCH_CONFIG.PROPERTY_KEY_STATS);
+  deleteTriggers_();
+  console.log("🔄 バッチ処理の進捗記録と自動トリガーをリセットしました。");
+}
+
+/**
+ * 【メイン関数】シートのURLを読み取り、配下の階層を再帰的に検索してリネームする
+ */
+function runFolderRenameFromSheetBatch() {
+  const startTime = Date.now();
+  
+  // トリガーの重複登録を防ぐため、実行開始時に既存のトリガーを念のため削除
+  deleteTriggers_();
+
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  const sheet = ss.getSheetByName(BATCH_CONFIG.SHEET_SF);
+  
+  if (!sheet) {
+    console.error(`エラー: シート「${BATCH_CONFIG.SHEET_SF}」が見つかりません。`);
+    return;
+  }
+
+  const data = sheet.getDataRange().getValues();
+  if (data.length <= 1) return;
+
+  const headers = data[0];
+  const urlColIndex = headers.indexOf(BATCH_CONFIG.TARGET_URL_HEADER);
+  if (urlColIndex === -1) {
+    console.error(`エラー: ヘッダー行に「${BATCH_CONFIG.TARGET_URL_HEADER}」が見つかりません。`);
+    return;
+  }
+
+  const scriptProperties = PropertiesService.getScriptProperties();
+  
+  // 1. 進捗行数の復元
+  const savedIndex = scriptProperties.getProperty(BATCH_CONFIG.PROPERTY_KEY_LAST_ROW);
+  let startIndex = 1;
+  if (savedIndex) {
+    startIndex = parseInt(savedIndex, 10);
+    console.log(`▶️ 【再開】バックグラウンド実行: ${startIndex + 1} 行目から処理を再開します。`);
+  } else {
+    console.log(`▶️ 【初回起動】処理を開始します。`);
+  }
+
+  // 2. 累計統計の復元
+  let cumulativeStats = { processed: 0, notFound: 0, errors: 0 };
+  const savedStats = scriptProperties.getProperty(BATCH_CONFIG.PROPERTY_KEY_STATS);
+  if (savedStats) {
+    cumulativeStats = JSON.parse(savedStats);
+  }
+
+  let isTimeout = false;
+
+  for (let i = startIndex; i < data.length; i++) {
+    // タイムアウトチェック (5分経過で中断し、次のトリガーを仕掛ける)
+    if (Date.now() - startTime > BATCH_CONFIG.TIME_LIMIT_MS) {
+      isTimeout = true;
+      
+      // 進捗と累計統計を保存
+      scriptProperties.setProperty(BATCH_CONFIG.PROPERTY_KEY_LAST_ROW, i.toString());
+      scriptProperties.setProperty(BATCH_CONFIG.PROPERTY_KEY_STATS, JSON.stringify(cumulativeStats));
+      
+      // 1分後に再開する時限トリガーをセット
+      ScriptApp.newTrigger(BATCH_CONFIG.MAIN_FUNCTION_NAME)
+               .timeBased()
+               .after(1 * 60 * 1000)
+               .create();
+               
+      console.warn(`⏳ 制限時間(5分)に到達。[${i + 1}行目]までの進捗を保存しました。`);
+      console.warn(`自動レジューム機能を有効化しました。1分後にバックグラウンドで続きから再開します（ブラウザを閉じても問題ありません）。`);
+      break;
+    }
+
+    if (i % 50 === 0) {
+      console.log(`... 現在 ${i + 1} 行目付近をスキャン中（総行数: ${data.length}）`);
+    }
+
+    const rawUrl = data[i][urlColIndex];
+    const driveId = extractCleanDriveIdForBatch_(rawUrl);
+    if (!driveId) continue;
+
+    try {
+      const parentFolder = DriveApp.getFolderById(driveId);
+      if (parentFolder.isTrashed()) continue;
+
+      const currentRunStats = { processedCount: 0, foundInCurrentTree: false };
+      processFoldersRecursively_(parentFolder, currentRunStats);
+
+      if (currentRunStats.foundInCurrentTree) {
+        cumulativeStats.processed += currentRunStats.processedCount;
+      } else {
+        cumulativeStats.notFound++;
+      }
+
+    } catch (e) {
+      console.error(`⚠️ アクセスエラー: [行 ${i + 1}] ID: ${driveId} 詳細: ${e.message}`);
+      cumulativeStats.errors++;
+    }
+  }
+
+  // 完走判定（タイムアウトせずに最後まで到達した場合）
+  if (!isTimeout) {
+    console.log(`-----------------------------------`);
+    console.log(`🎉 【全データ処理完了】すべての行のチェックとリネームが終わりました！`);
+    console.log(`[累計リネーム成功] : ${cumulativeStats.processed} 件`);
+    console.log(`[累計対象なし]     : ${cumulativeStats.notFound} 件`);
+    console.log(`[累計エラー]       : ${cumulativeStats.errors} 件`);
+    console.log(`-----------------------------------`);
+    
+    // 進捗データとトリガーを完全にお掃除
+    resetBatchProgress();
+  }
+}
