@@ -1360,6 +1360,7 @@ function writeWorkspaceData(mainSheet, allGeneratedData) {
  * かつ商談ID基準で対象行を再特定してから反映する。
  * これにより、Salesforceコネクタ側で行の並び順や件数が変わっていても、
  * A〜K列（Salesforceレポート由来の列）を誤って古い内容で上書きすることを防ぐ。
+ * 商談IDが空欄の行（紐づく実データが存在しない残留行）は、ステータス・URLをクリアする。
  * @param {Object} env - initializeAutoEnvironmentが返す実行コンテキスト
  * @returns {Array<Array<any>>} 反映後の最新シート全内容（log_SF保存等で再利用可能）
  */
@@ -1377,6 +1378,15 @@ function persistStatusAndUrlByOppId_(env) {
   }
 
   const mergedData = freshData.map(row => [...row]);
+
+  // 商談IDが空欄の行は、紐づく実データが存在しないためステータス・URLをクリアする
+  for (let i = 1; i < mergedData.length; i++) {
+    const oppId = String(freshData[i][env.indices.oppId] || "").trim();
+    if (!oppId) {
+      mergedData[i][env.indices.status] = "";
+      mergedData[i][env.indices.url] = "";
+    }
+  }
 
   // 今回の実行結果（env.sfValues）を、商談ID基準で現在のシート行に適用する
   const appliedOppIds = new Set();
