@@ -8,10 +8,18 @@ const CONFIG = {
   SHEET_SF: "raw_SF",
   SHEET_LOG: "log_SF",
   SHEET_ERROR_CACHE: "[システム]error_cache", // 独立したエラーキャッシュ用シート
+  SHEET_REFRESH_LOG: "Auto Refresh Execution Log", // Salesforceコネクタが自動生成するリフレッシュ実績ログ
   START_ROW: 9, // Workspaceシートのデータ書き込み開始行
   TIME_LIMIT_MS: 3.5 * 60 * 1000, // 3.5分 (GASの6分制限対策用のタイムアウト限界安全値)
   API_SLEEP_MS: 100, // APIレート制限回避用ウェイト (0.1秒)
-  SLACK_MAX_ERRORS_PER_DEPT: 10 // Slackの階層エラー通知で各部署ごとに表示する最大件数
+  SLACK_MAX_ERRORS_PER_DEPT: 10, // Slackの階層エラー通知で各部署ごとに表示する最大件数
+  PROP_LAST_REFRESH_KEY: "LAST_SEEN_RAWSF_REFRESH_KEY", // 前回検知したraw_SFリフレッシュを記録するスクリプトプロパティキー
+  // Slack通知用のカラーコード定義
+  SLACK_COLORS: {
+    SUCCESS: "#2eb67d", // 緑（成功）
+    WARNING: "#ecb22e", // 黄（警告・スキップ）
+    ERROR: "#e01e5a"    // 赤（エラー）
+  }
 };
 
 // =========================================================
@@ -230,16 +238,16 @@ function buildLayerDataFromMaster(masterData, startNo, layer1Name, monthList, su
 // Slack通知共通関数
 // =========================================================
 /**
- * SlackへPOSTリクエストを送信する内部関数
- * @param {string} text 送信するメッセージテキスト
+ * SlackへPOSTリクエストを送信する内部関数 (Payload受信型へ変更)
+ * @param {Object} payload 送信するJSONペイロードオブジェクト
  */
-function sendSlackMessage_(text) {
+function sendSlackMessage_(payload) {
   const webhookUrl = getSlackWebhookUrl();
-  if (!webhookUrl || !text) return;
+  if (!webhookUrl || !payload) return;
   const options = {
     "method": "POST",
     "contentType": "application/json",
-    "payload": JSON.stringify({ "text": text }),
+    "payload": JSON.stringify(payload),
     "muteHttpExceptions": true 
   };
   try {
@@ -262,102 +270,111 @@ function sendSlackNotification(newFolders, duplicateErrors = [], skippedGroups =
 
   // API制限回避用ヘルパー関数：通知の間に必ず1秒ウェイトを挟む
   let hasSentSomething = false;
-  const safeSend = (text) => {
+  const safeSend = (payload) => {
     if (hasSentSomething) Utilities.sleep(1000);
-    sendSlackMessage_(text);
+    sendSlackMessage_(payload);
     hasSentSomething = true;
   };
 
-  let mainBody = "";
-
-  // 1. 階層エラー（丸め表示）の構築
+  // 1. 階層エラー通知（赤色のアタッチメント）
   if (mismatchDepts.length > 0) {
-    mainBody += `🚨 *【警告】親フォルダ階層の不整合エラー*\n` +
-                `以下の理由により、指定されたURLのフォルダ階層が不正と判定されました。\n` +
-                `[原因1] 担当者が誤った場所（マイドライブや別部署など）のフォルダURLを指定している\n` +
-                `[原因2] 組織変更等により、SF上の「計上部署名」とドライブ上の親フォルダ名にズレが生じている\n` +
-                `-----------------------------------\n`;
+    let mismatchText = `以下の理由により、指定されたURLのフォルダ階層が不正と判定されました。\n` +
+                       `[原因1] 担当者が誤った場所（マイドライブや別部署など）のフォルダURLを指定している\n` +
+                       `[原因2] 組織変更等により、SF上の「計上部署名」とドライブ上の親フォルダ名にズレが生じている\n\n`;
     
     mismatchDepts.forEach(dept => {
       const errors = hierarchyMismatchAlerts[dept];
       const total = errors.length;
-      mainBody += `・SF上の計上部署名: \`${dept}\` （該当案件数: ${total}件）\n`;
+      mismatchText += `*・SF上の計上部署名:* \`${dept}\` （該当案件数: ${total}件）\n`;
       
       const displayLimit = CONFIG.SLACK_MAX_ERRORS_PER_DEPT || 10;
       const displayCount = Math.min(total, displayLimit);
       
       for(let i = 0; i < displayCount; i++) {
-        mainBody += `  - 商談: ${errors[i].name} / URL: ${errors[i].url}\n`;
+        mismatchText += `  - 商談: ${errors[i].name}\n    URL: ${errors[i].url}\n`;
       }
-      
       if (total > displayLimit) {
-        mainBody += `  ※他 ${total - displayLimit}件のエラーがあります。スプレッドシートのステータスを確認してください。\n`;
+        mismatchText += `  ※他 ${total - displayLimit}件のエラーがあります。スプレッドシートを確認してください。\n`;
       }
-      mainBody += `\n`;
+      mismatchText += `\n`;
     });
-    mainBody += `-----------------------------------\n\n`;
+
+    safeSend({
+      attachments: [{
+        color: CONFIG.SLACK_COLORS.ERROR,
+        title: "🚨 【警告】親フォルダ階層の不整合エラー",
+        text: mismatchText
+      }]
+    });
   }
   
-  // 2. スキップ案件の構築
+  // 2. スキップ案件通知（黄色のアタッチメント）
   if (skippedGroups.length > 0) {
-    mainBody += `\n⚠️ 【通知】マスタ生成条件不一致（対象外としてスキップ）\n` +
-                `以下の案件はマスタの条件（仕入先など）を満たさなかったため、「対象外」として処理されました。\n` +
-                `-----------------------------------\n`;
+    let skipText = `以下の案件はマスタの条件（仕入先など）を満たさなかったため、「対象外」として処理されました。\n\n`;
     skippedGroups.forEach(g => {
-      mainBody += `・商談名: ${g.oppName} (PJC: ${g.projectCode})\n`;
+      skipText += `・商談名: ${g.oppName} (PJC: ${g.projectCode})\n`;
     });
-    mainBody += `-----------------------------------`;
+
+    safeSend({
+      attachments: [{
+        color: CONFIG.SLACK_COLORS.WARNING,
+        title: "⚠️ 【通知】マスタ生成条件不一致（対象外としてスキップ）",
+        text: skipText
+      }]
+    });
   }
 
-  // メイン通知（警告系）の送信
-  if (mainBody) {
-    safeSend(mainBody);
-  }
-
-  // 3. 新規作成フォルダの分割（バッチ）送信ロジック
+  // 3. 新規作成フォルダ通知（緑色のアタッチメント・分割処理対応）
   if (newFolders.length > 0) {
     const successLimit = 20; 
     for (let i = 0; i < newFolders.length; i += successLimit) {
       const chunk = newFolders.slice(i, i + successLimit);
-      let successBody = `📁 証憑フォルダが新規作成されました（計 ${newFolders.length} 件）\n`;
-      
+      let titleStr = `📁 証憑フォルダが新規作成されました（計 ${newFolders.length} 件）`;
       if (newFolders.length > successLimit) {
-        successBody = `*[分割通知 ${Math.floor(i / successLimit) + 1}/${Math.ceil(newFolders.length / successLimit)}]* ` + successBody;
+        titleStr = `[分割通知 ${Math.floor(i / successLimit) + 1}/${Math.ceil(newFolders.length / successLimit)}] ` + titleStr;
       }
-      successBody += `-----------------------------------\n`;
-      
+
+      let successText = "";
       chunk.forEach((f) => {
-        successBody += `${f.name}\n${f.url}\n\n`;
+        successText += `*${f.name}*\n${f.url}\n\n`;
       });
-      successBody += `-----------------------------------`;
       
-      safeSend(successBody);
+      safeSend({
+        attachments: [{
+          color: CONFIG.SLACK_COLORS.SUCCESS,
+          title: titleStr,
+          text: successText
+        }]
+      });
     }
   }
 
-  // 4. 重複エラーの分割（バッチ）送信ロジック
+  // 4. 重複エラー通知（赤色のアタッチメント・分割処理対応・表示名改善対応）
   if (duplicateErrors.length > 0) {
     let flatDupMessages = [];
     duplicateErrors.forEach(err => {
-      err.oppIds.forEach(oppId => {
-        flatDupMessages.push(`・対象商談ID: ${oppId} (URL: ${err.url})`);
+      err.oppDetails.forEach(oppInfo => {
+        flatDupMessages.push(`・対象商談: ${oppInfo}\n  URL: ${err.url}`);
       });
     });
 
     const dupLimit = 10;
     for (let i = 0; i < flatDupMessages.length; i += dupLimit) {
       const chunk = flatDupMessages.slice(i, i + dupLimit);
-      let dupBody = `\n🚨 【警告】URL重複エラー（新規検知 / 処理スキップ）\n` +
-                    `異なる商談間で同一のURLが指定されています。Salesforceのデータを確認してください。\n` +
-                    `-----------------------------------\n` +
-                    chunk.join("\n") +
-                    `\n-----------------------------------`;
-      
+      let titleStr = `🚨 【警告】URL重複エラー（新規検知 / 処理スキップ）`;
       if (flatDupMessages.length > dupLimit) {
-        dupBody = `*[分割通知 ${Math.floor(i / dupLimit) + 1}/${Math.ceil(flatDupMessages.length / dupLimit)}]* ` + dupBody;
+        titleStr = `[分割通知 ${Math.floor(i / dupLimit) + 1}/${Math.ceil(flatDupMessages.length / dupLimit)}] ` + titleStr;
       }
+
+      let dupText = `異なる商談間で同一のURLが指定されています。Salesforceのデータを確認してください。\n\n` + chunk.join("\n\n");
       
-      safeSend(dupBody);
+      safeSend({
+        attachments: [{
+          color: CONFIG.SLACK_COLORS.ERROR,
+          title: titleStr,
+          text: dupText
+        }]
+      });
     }
   }
 }
@@ -535,7 +552,38 @@ function setNextTrigger() {
 }
 
 // =========================================================
-// 【自動モード】メイン関数 (★v2.0.9 エラー時URL記録・スパム完全防止版)
+// 【raw_SFリフレッシュ検知】
+// =========================================================
+/**
+ * 「Auto Refresh Execution Log」シートから、raw_SFに対する直近の成功リフレッシュを示す
+ * 一意なキー（タイムスタンプ）を取得する。ログシートが存在しない、または該当行がない場合はnullを返す。
+ * ログは新しい行が先頭（2行目）に追加される前提で、上から順に最初に一致した行を採用する。
+ * @returns {string|null} 直近の成功リフレッシュを示すキー文字列。取得不能な場合はnull
+ */
+function getLatestRawSfRefreshKey_() {
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  const logSheet = ss.getSheetByName(CONFIG.SHEET_REFRESH_LOG);
+  if (!logSheet) return null;
+
+  const lastRow = logSheet.getLastRow();
+  if (lastRow < 2) return null;
+
+  // A:Refresh Time, B:Sheet, C:Operation, D:Status の4列を読む
+  const data = logSheet.getRange(2, 1, lastRow - 1, 4).getValues();
+
+  for (let i = 0; i < data.length; i++) {
+    const sheetName = String(data[i][1]).trim();
+    const status = String(data[i][3]).trim();
+    if (sheetName === CONFIG.SHEET_SF && status === "Success") {
+      const ts = data[i][0];
+      return (ts instanceof Date) ? String(ts.getTime()) : String(ts).trim();
+    }
+  }
+  return null;
+}
+
+// =========================================================
+// 【自動モード】メイン関数
 // =========================================================
 /**
  * SFデータから自動的にフォルダを生成するメイン処理
@@ -555,6 +603,32 @@ function auto_make_folder_from_sf(isContinuation = false) {
   clearDynamicTriggers();
 
   try {
+    // 1.5. raw_SFリフレッシュ状況の確認
+    //   ・自動実行（トリガー / ui===null）: 前回検知したリフレッシュと変化がなければスキップ
+    //   ・手動実行（メニュー / ui!==null）: Salesforceコネクタをマニュアル更新した直後に即実行したい
+    //     ケースがあるため、リフレッシュ状況に関わらず常に続行する
+    if (!isContinuation) {
+      const props = PropertiesService.getScriptProperties();
+      const latestKey = getLatestRawSfRefreshKey_();
+      const lastSeenKey = props.getProperty(CONFIG.PROP_LAST_REFRESH_KEY);
+      const isAutomaticRun = (ui === null);
+
+      if (isAutomaticRun && latestKey !== null && latestKey === lastSeenKey) {
+        console.log("【自動実行】raw_SFの最新リフレッシュに変化がないため、今回の実行をスキップしました。（前回検知キー: " + lastSeenKey + "）");
+        return;
+      }
+
+      if (latestKey !== null) {
+        props.setProperty(CONFIG.PROP_LAST_REFRESH_KEY, latestKey);
+      } else if (isAutomaticRun) {
+        console.warn("Auto Refresh Execution Logからraw_SFのリフレッシュ状況を確認できなかったため、安全側として処理を続行します。");
+      }
+
+      if (!isAutomaticRun) {
+        console.log("手動実行のため、raw_SFリフレッシュ状況のチェックをスキップして続行します。");
+      }
+    }
+
     // 2. 環境とキャッシュの初期化
     const env = initializeAutoEnvironment(ui, startTime);
     if (!env) return; 
@@ -586,9 +660,10 @@ function auto_make_folder_from_sf(isContinuation = false) {
 
     // 処理すべき対象がゼロなら即終了
     if (totalTargets === 0) {
+      let finalData = env.sfValues;
       if (env.hasUpdates) {
-        env.sfSheet.getRange(1, 1, env.sfValues.length, env.sfValues[0].length).setValues(env.sfValues);
-        saveLogSheetSafely_(env.logSheet, env.sfValues);
+        finalData = persistStatusAndUrlByOppId_(env);
+        saveLogSheetSafely_(env.logSheet, finalData);
         SpreadsheetApp.flush();
       }
       sendSlackNotification([], duplicateErrors, [], {});
@@ -651,7 +726,6 @@ function auto_make_folder_from_sf(isContinuation = false) {
           group.rowIndexes.forEach(rowIdx => {
             const r = rowIdx - 1;
             env.sfValues[r][env.indices.status] = checkRes.status;
-            // ★ v2.0.9 修正: 階層不一致エラーの際も、エラー対象となったURLをログに必ず記録する
             env.sfValues[r][env.indices.url] = group.folderUrl; 
             env.hasUpdates = true;
           });
@@ -687,7 +761,6 @@ function auto_make_folder_from_sf(isContinuation = false) {
         group.rowIndexes.forEach(rowIdx => {
           const r = rowIdx - 1;
           env.sfValues[r][env.indices.status] = "エラー(作成失敗)";
-          // ★ v2.0.9 修正: 作成失敗時もURLを記録する
           env.sfValues[r][env.indices.url] = group.folderUrl; 
           env.hasUpdates = true;
         });
@@ -704,8 +777,9 @@ function auto_make_folder_from_sf(isContinuation = false) {
     }
     flushBadUrls(env);
 
+    let finalSfData = env.sfValues;
     if (env.hasUpdates) {
-      env.sfSheet.getRange(1, 1, env.sfValues.length, env.sfValues[0].length).setValues(env.sfValues);
+      finalSfData = persistStatusAndUrlByOppId_(env);
       SpreadsheetApp.flush();
     }
 
@@ -713,7 +787,7 @@ function auto_make_folder_from_sf(isContinuation = false) {
     sendSlackNotification(newlyCreatedLayer1Folders, duplicateErrors, masterSkippedGroups, hierarchyMismatchAlerts);
 
     if (isTimeout) {
-      saveLogSheetSafely_(env.logSheet, env.sfValues);
+      saveLogSheetSafely_(env.logSheet, finalSfData);
 
       const remain = totalTargets - processedCount;
       const msg = `⚠️ 処理時間が上限（3.5分）に達したため中断しました。\n` +
@@ -1110,7 +1184,7 @@ function buildLogDataMaps(logData) {
     if (idx.oppId !== -1 && idx.url !== -1) {
       const oppIdStr = String(logData[i][idx.oppId]).trim(); 
       const urlStr = String(logData[i][idx.url]).trim();
-      if (oppIdStr && urlStr) logUrlMap[oppIdStr] = logUrlMap[oppIdStr] = urlStr;
+      if (oppIdStr && urlStr) logUrlMap[oppIdStr] = urlStr;
     }
   }
   return { logSet, logUrlMap };
@@ -1130,6 +1204,9 @@ function parseSfDataAndDetectChangesAll(env, logSet, logUrlMap) {
     const oppId = String(sfValues[i][indices.oppId]).trim();
     if (!oppId) continue;
     
+    // ★v2.0.11 追加: 商談名を取得し、未設定の場合はプレースホルダを代入
+    const oppName = sfValues[i][indices.name] ? String(sfValues[i][indices.name]).trim() : "商談名未設定";
+
     let rawSfStorageUrl = (indices.sfStorageUrl !== -1 && sfValues[i][indices.sfStorageUrl]) ? String(sfValues[i][indices.sfStorageUrl]).trim() : "";
     if (rawSfStorageUrl) {
       const extractedId = extractCleanDriveId_(rawSfStorageUrl);
@@ -1144,7 +1221,8 @@ function parseSfDataAndDetectChangesAll(env, logSet, logUrlMap) {
 
     if (determinedUrl) {
       if (!duplicateUrlMap[determinedUrl]) duplicateUrlMap[determinedUrl] = new Set();
-      duplicateUrlMap[determinedUrl].add(oppId);
+      // ★v2.0.11 修正: 商談ID単体ではなく「商談名（商談ID）」として記録
+      duplicateUrlMap[determinedUrl].add(`${oppName}（${oppId}）`);
     }
   }
 
@@ -1192,7 +1270,6 @@ function parseSfDataAndDetectChangesAll(env, logSet, logUrlMap) {
           continue;
       } else {
           sfValues[i][indices.status] = "エラー(URL重複)";
-          // ★ v2.0.9 修正: 重複エラーの際も、エラー対象となったURLをログに必ず記録する
           sfValues[i][indices.url] = determinedUrl; 
           env.hasUpdates = true;
           newDuplicateUrls.add(determinedUrl); 
@@ -1252,7 +1329,8 @@ function parseSfDataAndDetectChangesAll(env, logSet, logUrlMap) {
 
   const duplicateErrors = [];
   newDuplicateUrls.forEach(url => {
-    duplicateErrors.push({ url: url, oppIds: Array.from(duplicateUrlMap[url]) });
+    // ★v2.0.11 キー名を oppDetails に変更
+    duplicateErrors.push({ url: url, oppDetails: Array.from(duplicateUrlMap[url]) });
   });
   
   return { groups, duplicateErrors };
@@ -1274,6 +1352,62 @@ function writeWorkspaceData(mainSheet, allGeneratedData) {
   mainSheet.getRange(startRow, 1, formattedData.length, maxCol).setValues(formattedData);
 }
 
+// =========================================================
+// 【raw_SF書き戻し】商談ID基準の安全なマージ書き込み
+// =========================================================
+/**
+ * raw_SFへの書き戻しを、GASが担当する「自動作成ステータス」「格納先フォルダURL」の2列に限定し、
+ * かつ商談ID基準で対象行を再特定してから反映する。
+ * これにより、Salesforceコネクタ側で行の並び順や件数が変わっていても、
+ * A〜K列（Salesforceレポート由来の列）を誤って古い内容で上書きすることを防ぐ。
+ * @param {Object} env - initializeAutoEnvironmentが返す実行コンテキスト
+ * @returns {Array<Array<any>>} 反映後の最新シート全内容（log_SF保存等で再利用可能）
+ */
+function persistStatusAndUrlByOppId_(env) {
+  const freshData = env.sfSheet.getDataRange().getValues();
+  if (freshData.length === 0) return freshData;
+
+  // 現在のシート上での「商談ID → 行インデックス（0始まり、freshData基準）」マップを構築
+  const oppIdToRows = {};
+  for (let i = 1; i < freshData.length; i++) {
+    const oppId = String(freshData[i][env.indices.oppId] || "").trim();
+    if (!oppId) continue;
+    if (!oppIdToRows[oppId]) oppIdToRows[oppId] = [];
+    oppIdToRows[oppId].push(i);
+  }
+
+  const mergedData = freshData.map(row => [...row]);
+
+  // 今回の実行結果（env.sfValues）を、商談ID基準で現在のシート行に適用する
+  const appliedOppIds = new Set();
+  for (let i = 1; i < env.sfValues.length; i++) {
+    const oppId = String(env.sfValues[i][env.indices.oppId] || "").trim();
+    if (!oppId || appliedOppIds.has(oppId)) continue;
+    appliedOppIds.add(oppId);
+
+    const targetRows = oppIdToRows[oppId];
+    if (!targetRows || targetRows.length === 0) {
+      // 現在のシートにこの商談IDが見つからない（削除・大幅な入替等）場合は反映せずスキップ
+      continue;
+    }
+
+    const newStatus = env.sfValues[i][env.indices.status];
+    const newUrl = env.sfValues[i][env.indices.url];
+    targetRows.forEach(r => {
+      mergedData[r][env.indices.status] = newStatus;
+      mergedData[r][env.indices.url] = newUrl;
+    });
+  }
+
+  const numRows = mergedData.length;
+  env.sfSheet.getRange(1, env.indices.status + 1, numRows, 1)
+    .setValues(mergedData.map(row => [row[env.indices.status]]));
+  env.sfSheet.getRange(1, env.indices.url + 1, numRows, 1)
+    .setValues(mergedData.map(row => [row[env.indices.url]]));
+
+  return mergedData;
+}
+
 function finalizeSuccess(env, createdCount, totalRows, ui, duplicateErrors = [], isAlreadyDone = false) {
   const finalData = env.sfSheet.getDataRange().getValues(); 
   saveLogSheetSafely_(env.logSheet, finalData);
@@ -1289,6 +1423,12 @@ function finalizeSuccess(env, createdCount, totalRows, ui, duplicateErrors = [],
   else console.log(msg);
 }
 
+/**
+ * log_SFへ内容を安全に保存する。行・列を問わず余分な残留データが残らないよう、
+ * 既存の使用範囲を一度クリアしてから新しい内容を書き込む。
+ * @param {GoogleAppsScript.Spreadsheet.Sheet} logSheet - 保存先のログシート
+ * @param {Array<Array<any>>} data - 書き込むデータ
+ */
 function saveLogSheetSafely_(logSheet, data) {
   try {
     if (!logSheet || !data || !Array.isArray(data) || data.length === 0 || !data[0] || !Array.isArray(data[0]) || data[0].length === 0) {
@@ -1296,24 +1436,13 @@ function saveLogSheetSafely_(logSheet, data) {
       return;
     }
 
-    const numRows = data.length;
-    const numCols = data[0].length;
-    const lastRow = logSheet.getLastRow();
-    const lastCol = logSheet.getLastColumn();
-
-    logSheet.getRange(1, 1, numRows, numCols).setValues(data);
-
-    if (lastRow > numRows) {
-      const clearRows = lastRow - numRows;
-      const clearCols = Math.max(lastCol || 1, numCols);
-
-      if (clearRows > 0 && clearCols > 0) {
-        const targetRange = logSheet.getRange(numRows + 1, 1, clearRows, clearCols);
-        if (targetRange && typeof targetRange.clearContents === 'function') {
-          targetRange.clearContents();
-        }
-      }
+    // 行・列どちらの余りも確実に防ぐため、既存の使用範囲を一度クリアしてから書き込む
+    const existingRange = logSheet.getDataRange();
+    if (existingRange) {
+      existingRange.clearContent();
     }
+
+    logSheet.getRange(1, 1, data.length, data[0].length).setValues(data);
     SpreadsheetApp.flush();
   } catch (err) {
     console.error("saveLogSheetSafely_ 実行時に例外が発生しましたが、基本保存は完了しています: " + err.message);
