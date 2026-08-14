@@ -57,7 +57,6 @@ function onOpen() {
   const menu = ui.createMenu("スクリプト");
   menu.addItem("【手動】個別フォルダ生成＆作成", "manual_make_folder");
   menu.addItem("【自動】SFデータから一括作成", "auto_make_folder_from_sf");
-  menu.addItem("【監査】誤作成フォルダ検知", "startFolderAudit");
   menu.addToUi();
 }
 
@@ -586,10 +585,15 @@ function getLatestRawSfRefreshKey_() {
 // 【自動モード】メイン関数
 // =========================================================
 /**
- * SFデータから自動的にフォルダを生成するメイン処理
- * @param {boolean} isContinuation - トリガーによる分割実行からの再開かどうかのフラグ
+ * SFデータから自動的にフォルダを生成するメイン処理。
+ * 注意：時間主導型トリガーはこの関数呼び出し時にトリガーのイベントオブジェクトを
+ * 第一引数として自動的に渡してくる（GAS仕様）。そのため、真偽値の厳密比較（=== true）で
+ * 判定し、イベントオブジェクトが渡された場合でも誤って「継続実行」と判定しないようにしている。
+ * @param {boolean|Object} continuationArg - 継続実行時は明示的に true。トリガー実行時はイベントオブジェクトが入るため、=== true でのみ継続実行とみなす。
  */
-function auto_make_folder_from_sf(isContinuation = false) {
+function auto_make_folder_from_sf(continuationArg) {
+  const isContinuation = (continuationArg === true);
+
   // 1. 排他制御 (LockServiceによる同時起動・割り込み防止)
   const lock = LockService.getScriptLock();
   if (!lock.tryLock(10000)) { 
@@ -622,10 +626,6 @@ function auto_make_folder_from_sf(isContinuation = false) {
         props.setProperty(CONFIG.PROP_LAST_REFRESH_KEY, latestKey);
       } else if (isAutomaticRun) {
         console.warn("Auto Refresh Execution Logからraw_SFのリフレッシュ状況を確認できなかったため、安全側として処理を続行します。");
-      }
-
-      if (!isAutomaticRun) {
-        console.log("手動実行のため、raw_SFリフレッシュ状況のチェックをスキップして続行します。");
       }
     }
 
